@@ -166,7 +166,9 @@ class FactorPreprocessor:
                 continue
             med = np.median(w_clean)
             mad = np.median(np.abs(w_clean - med)) * 1.4826
-            result.iloc[i] = np.clip(values[i], med - n * mad, med + n * mad)
+            result.iloc[i] = np.clip(values[i], med - n * mad, med + n * mad) #即不能超过三倍标准差,超过的地方按上下限截断
+
+
 
         return result
 

@@ -91,7 +91,7 @@ def load_data(data_dir: str | Path = "data_ini",
              price_file: str = "price_df.csv",
              signal_file: str = "signal.csv") -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    从 data_ini/ 目录加载价格和信号 CSV 文件。
+    从 data_ini/ 目录加载价格和信号 CSV 文件。将第一列日期列转换为索引，并按照日期格式处理和排序
 
     文件名通过 config.yaml 的 data.price_file / data.signal_file 指定。
 
@@ -125,35 +125,44 @@ def extract_price_series(price_df: pd.DataFrame,
                           price_field: str = "CLOSE") -> pd.Series:
     """
     从多资产价格 DataFrame 中智能提取指定资产的价格序列。
+    虽然建议在数据表字段按照‘datetime-code-CLOSE’名称严格设置，但这里依旧给予了几项可能的匹配策略。
 
-    尝试顺序：
-    1. 列名 = asset_code（列本身就是CLOSE价格）
-    2. 列名 = "{asset_code}_{price_field}"
-    3. 列名 = "{price_field}"（单资产文件）
-    4. 多级索引 (asset_code, price_field)
-    5. 大小写不敏感的模糊匹配
     """
-    # 策略1：列名直接是 asset_code
+    #策略main: 如果结构式 datetime-code-CLOSE，直接提取
+    code_columns_name = ['code','asset_code','wind_code','sec_code']
+    for code_col in code_columns_name:
+        if code_col in price_df.columns:
+            print(f"匹配资产代码列名：{code_col}")
+            price_df = price_df[price_df[code_col] == asset_code]
+            return price_df[price_field].dropna().rename("price")
+
+
+    # 策略1：如果结构是 datetime-code1-code2-code3
     if asset_code in price_df.columns:
+        print(f"直接匹配资产代码列：{asset_code}")
         return price_df[asset_code].dropna().rename("price")
 
-    # 策略2：列名为 "{code}_{field}"
+    # 策略2：如果结构是 datetime-code1_CLOSE-code2-code3
     col2 = f"{asset_code}_{price_field}"
     if col2 in price_df.columns:
+        print(f"匹配资产代码和字段名：{col2}")
         return price_df[col2].dropna().rename("price")
 
-    # 策略3：单资产，列名直接是 price_field
+    # 策略3：单资产，结构为 datetime-CLOSE
     pf_lower = price_field.lower()
     exact_matches = [c for c in price_df.columns
                      if isinstance(c, str) and c.lower() == pf_lower]
     if len(exact_matches) == 1:
+        print(f"直接匹配字段名（大小写敏感）：{exact_matches[0]}")
         return price_df[exact_matches[0]].dropna().rename("price")
 
     # 策略4：MultiIndex 列
     if isinstance(price_df.columns, pd.MultiIndex):
         if (asset_code, price_field) in price_df.columns:
+            print(f"匹配 MultiIndex 资产代码和字段名：{asset_code, price_field}")
             return price_df[(asset_code, price_field)].dropna().rename("price")
         if (asset_code, price_field.lower()) in price_df.columns:
+            print(f"匹配 MultiIndex 资产代码和字段名（大小写敏感）：{asset_code, price_field.lower()}")
             return price_df[(asset_code, price_field.lower())].dropna().rename("price")
 
     # 策略5：大小写不敏感模糊匹配（含资产代码和字段名）
@@ -161,6 +170,7 @@ def extract_price_series(price_df: pd.DataFrame,
         if isinstance(col, str):
             cl = col.lower()
             if asset_code.lower() in cl and pf_lower in cl:
+                print(f"大小写不敏感模糊匹配：{col}")
                 return price_df[col].dropna().rename("price")
 
     # 均未匹配，给出明确的错误信息
@@ -192,6 +202,130 @@ def select_signals(signal_df: pd.DataFrame, cfg_signals: dict) -> pd.DataFrame:
             f"signal.csv 现有列：{list(signal_df.columns)}"
         )
     return signal_df[selected]
+
+
+def _prepare_eval_data(
+    raw_signal: pd.Series,
+    prices: pd.Series,
+    rolling_window: int,
+) -> Tuple[pd.Series, pd.Series, pd.Series, int, str, int]:
+    """
+    根据信号的实际观测频率，自动准备评估专用数据集。
+
+    问题背景
+    --------
+    若把低频信号（如周度/月度）前向填充到日度后再计算 IC，
+    滚动窗口内会存在大量重复值（同一信号值与多个日度收益配对），
+    导致有效自由度被严重高估、T 统计量失真。
+
+    解决方案：评估与回测分离
+    -------------------------
+    - **评估**：信号保持自然频率，收益率同步降频到信号观测日之间的
+      "期间收益"（P[t]/P[t-1]-1，t 为相邻信号日），IC 无重复计数。
+    - **回测**：信号前向填充到日度，使仓位在信号更新前保持不变，
+      符合实际交易逻辑（由调用方处理）。
+
+    频率检测
+    --------
+    用价格日历（交易日）统计相邻信号观测日的中位间隔，自动判断频率。
+    不依赖 config，任意不规则频率均可处理。
+
+    参数
+    ----
+    raw_signal     : 原始信号序列（含 NaN，dropna 后为实际观测日）
+    prices         : 日度收盘价序列（交易日日历）
+    rolling_window : config 中指定的滚动窗口（交易日数，默认 252）
+
+    返回
+    ----
+    eval_signal     : 信号观测日上的因子序列（dropna 后）
+    eval_prices     : 与信号观测日对齐的收盘价
+    eval_returns    : 相邻信号观测日之间的期间收益率
+    adjusted_window : 按频率等比缩放后的滚动窗口（信号观测数）
+    freq_label      : 可读频率标签（"日度"/"周度"/"月度" 等）
+    median_gap      : 中位交易日间隔（=1 即为日度）
+    """
+    signal_obs = raw_signal.dropna()
+    if len(signal_obs) < 5:
+        raise ValueError(
+            f"信号有效观测点不足（{len(signal_obs)} 条），无法评估。"
+        )
+
+    # ── 非交易日对齐：将信号日期映射到最近的上一个交易日 ────────────
+    # 规则：
+    #   - 若目标交易日本身已有信号值 → 直接丢弃该非交易日信号（不覆盖）
+    #   - 若目标交易日为空           → 映射过去
+    price_idx = prices.index
+    not_in_calendar = ~signal_obs.index.isin(price_idx)
+    if not_in_calendar.any():
+        n_total = int(not_in_calendar.sum())
+
+        trading_signals     = signal_obs[~not_in_calendar]   # 已在交易日上的信号
+        non_trading_signals = signal_obs[not_in_calendar]    # 需要处理的非交易日信号
+
+        # 找每个非交易日对应的最近上一交易日
+        snap_pos    = price_idx.searchsorted(non_trading_signals.index, side="right") - 1
+        snap_pos    = np.clip(snap_pos, 0, len(price_idx) - 1)
+        snapped_dates = price_idx[snap_pos]
+
+        # 已被占用的交易日（初始为所有已有信号的交易日）
+        occupied = set(trading_signals.index)
+
+        n_mapped, n_dropped = 0, 0
+        mapped_items: dict = {}
+
+        for snapped_date, value in zip(snapped_dates, non_trading_signals.values):
+            if snapped_date in occupied:
+                # 目标交易日已有值 → 丢弃
+                n_dropped += 1
+            else:
+                # 目标交易日为空 → 映射
+                mapped_items[snapped_date] = value
+                occupied.add(snapped_date)   # 防止后续信号再次映射到同一天
+                n_mapped += 1
+
+        if mapped_items:
+            extra = pd.Series(mapped_items, name=signal_obs.name)
+            signal_obs = pd.concat([trading_signals, extra]).sort_index()
+        else:
+            signal_obs = trading_signals
+
+        print(f"  [日期对齐] {n_total} 个信号不在交易日历中："
+              f"{n_mapped} 个映射到最近上一交易日，{n_dropped} 个因目标日已有值而丢弃")
+
+    # ── 检测频率：用价格日历计量相邻信号日之间的交易日数 ─────────────
+    pos_in_price = price_idx.searchsorted(signal_obs.index, side="left")
+    # 截断越界（信号日晚于价格最后一天的情况）
+    pos_in_price = np.clip(pos_in_price, 0, len(price_idx) - 1)
+    gaps = np.diff(pos_in_price)
+    median_gap = int(np.median(gaps)) if len(gaps) > 0 else 1
+    median_gap = max(1, median_gap)
+
+    # ── 频率标签 ────────────────────────────────────────────────────────
+    if   median_gap <= 2:  freq_label = "日度"
+    elif median_gap <= 4:  freq_label = "2-3日"
+    elif median_gap <= 7:  freq_label = "周度"
+    elif median_gap <= 12: freq_label = "半月度"
+    elif median_gap <= 25: freq_label = "月度"
+    elif median_gap <= 70: freq_label = "季度"
+    else:                  freq_label = f"约{median_gap}交易日/次"
+
+    # ── 对齐价格到信号观测日（取最近交易日收盘价）─────────────────────
+    eval_prices = prices.reindex(signal_obs.index, method="ffill")
+
+    # ── 期间收益率：相邻信号观测日之间的累积收益 ─────────────────────
+    # eval_returns[t_k] = P[t_k]/P[t_{k-1}] - 1
+    # evaluator 内部会再 shift(-n) 以获取 n 期前瞻收益
+    eval_returns = eval_prices.pct_change()
+
+    # ── 日度信号：直接使用日度收益，滚动窗口不需调整 ─────────────────
+    if median_gap <= 2:
+        daily_returns = prices.pct_change().reindex(signal_obs.index)
+        return signal_obs, eval_prices, daily_returns, rolling_window, freq_label, median_gap
+
+    # ── 非日度信号：等比缩放滚动窗口（保持约 1 年时间跨度）───────────
+    adjusted_window = max(10, round(rolling_window / median_gap))
+    return signal_obs, eval_prices, eval_returns, adjusted_window, freq_label, median_gap
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -306,8 +440,8 @@ class ExcelReporter:
         ws.sheet_view.showGridLines = False
         ws.freeze_panes = "A3"
 
-        # 大标题
-        ws.merge_cells("A1:N1")
+        # 大标题（合并范围随列数同步：14列 → 16列）
+        ws.merge_cells("A1:P1")
         title_cell = ws["A1"]
         title_cell.value = f"择时因子评价报告  |  资产：{asset_name}"
         title_cell.font      = Font(bold=True, size=14, color=self._C_TITLE, name="微软雅黑")
@@ -316,7 +450,8 @@ class ExcelReporter:
         ws.row_dimensions[1].height = 28
 
         headers = [
-            "信号名称", "IC均值(1日)", "ICIR(1日)", "IC正值占比",
+            "信号名称", "预测周期", "IC方法",
+            "IC均值", "ICIR", "IC正值占比",
             "胜率(阈值法)", "胜率(均线法)", "胜率(极值法)",
             "β系数", "β显著性", "R²",
             "样本外稳健", "IC衰减幅度",
@@ -331,9 +466,9 @@ class ExcelReporter:
 
             # 取各指标
             ic1 = (ev._ic_results or {}).get(ev.forward_period)
-            sig1 = (ev._signal_results or {}).get("threshold")
-            sig2 = (ev._signal_results or {}).get("moving_average")
-            sig3 = (ev._signal_results or {}).get("percentile")
+            sig1 = (ev._signal_results or {}).get("threshold")[0]
+            sig2 = (ev._signal_results or {}).get("moving_average")[0]
+            sig3 = (ev._signal_results or {}).get("percentile")[0]
             reg  = ev._reg_result
             rob  = ev._robustness_result
             sc   = ev.score()
@@ -352,6 +487,8 @@ class ExcelReporter:
 
             values = [
                 sig_name,
+                f"{ev.forward_period}期",
+                ev.ic_method.upper(),
                 self._f4(ic_mean),  self._f4(icir),   self._pct(ic_pos_r),
                 self._pct(wr1),     self._pct(wr2),   self._pct(wr3),
                 self._f4(beta),     beta_sig,          self._f4(r2),
@@ -361,16 +498,16 @@ class ExcelReporter:
             ]
             self._write_data_row(ws, row=row, values=values, alt=alt)
 
-            # 着色：IC/ICIR/胜率/评分
+            # 着色：IC/ICIR/胜率/评分（列索引随新增列右移2位）
             cells = [ws.cell(row, j+1) for j in range(len(values))]
-            for ci, val in [(1, ic_mean), (2, icir)]:
+            for ci, val in [(3, ic_mean), (4, icir)]:
                 self._color_cell(cells[ci], val if val is not None else 0)
-            for ci, val in [(4, wr1), (5, wr2), (6, wr3)]:
+            for ci, val in [(6, wr1), (7, wr2), (8, wr3)]:
                 self._color_cell(cells[ci], val - 0.5 if val is not None else None)
-            # 评级列着色
+            # 评级列着色（第15列，索引15）
             grade_colors = {"A": "B2EBF2", "B": "C8E6C9", "C": "FFF9C4",
                             "D": "FFE0B2", "F": "FFCDD2"}
-            cells[13].fill = self._hfill(grade_colors.get(sc.grade, "FFFFFF"))
+            cells[15].fill = self._hfill(grade_colors.get(sc.grade, "FFFFFF"))
 
         self._auto_width(ws)
 
@@ -437,26 +574,26 @@ class ExcelReporter:
                 alt = (row % 2 == 0)
                 values = [
                     sig_name, method_label.get(method, method),
-                    res.n_long,
-                    self._pct(res.long_win_rate),
-                    self._f4(res.long_avg_return),
-                    self._f4(res.long_pl_ratio),
-                    res.n_short,
-                    self._pct(res.short_win_rate),
-                    self._f4(res.short_avg_return),
-                    self._f4(getattr(res, "short_pl_ratio", None)),
-                    self._pct(res.overall_win_rate),
-                    self._f4(res.long_short_return_spread),
-                    self._f4(res.t_statistic),
-                    self._f4(res.p_value),
-                    "✓ 显著" if res.is_significant else "✗ 不显著",
+                    res[0].n_long,
+                    self._pct(res[0].long_win_rate),
+                    self._f4(res[0].long_avg_return),
+                    self._f4(res[0].long_pl_ratio),
+                    res[0].n_short,
+                    self._pct(res[0].short_win_rate),
+                    self._f4(res[0].short_avg_return),
+                    self._f4(getattr(res[0], "short_pl_ratio", None)),
+                    self._pct(res[0].overall_win_rate),
+                    self._f4(res[0].long_short_return_spread),
+                    self._f4(res[0].t_statistic),
+                    self._f4(res[0].p_value),
+                    "✓ 显著" if res[0].is_significant else "✗ 不显著",
                 ]
                 self._write_data_row(ws, row=row, values=values, alt=alt)
                 # 胜率着色
                 self._color_cell(ws.cell(row, 4),
-                                  res.long_win_rate - 0.5)
+                                  res[0].long_win_rate - 0.5)
                 self._color_cell(ws.cell(row, 11),
-                                  res.overall_win_rate - 0.5)
+                                  res[0].overall_win_rate - 0.5)
                 row += 1
 
         self._auto_width(ws)
@@ -570,6 +707,7 @@ class ExcelReporter:
             "总收益率(策略)", "年化收益(策略)", "年化波动(策略)",
             "Sharpe(策略)",  "最大回撤(策略)", "Calmar(策略)",
             "日胜率(策略)",  "交易次数",
+            "交易胜率",      "持有时间占比",   "赔率",          "超额胜率",
             "总收益率(基准)", "年化收益(基准)", "Sharpe(基准)",
             "最大回撤(基准)",
             "超额年化收益",   "超额Sharpe",
@@ -594,6 +732,10 @@ class ExcelReporter:
                 self._f4(ms["calmar"]),
                 self._pct(ms["win_rate"]),
                 ms.get("n_trades", 0),
+                self._pct(ms.get("trade_win_rate")),
+                self._pct(ms.get("holding_ratio")),
+                self._f4(ms.get("odds_ratio")),
+                self._pct(ms.get("excess_win_rate")),
                 self._pct(mb["total_return"]),
                 self._pct(mb["annual_return"]),
                 self._f4(mb["sharpe"]),
@@ -610,8 +752,20 @@ class ExcelReporter:
             self._color_cell(ws.cell(r, 5),  ms["sharpe"])
             # 最大回撤着色（越小越好）
             self._color_cell(ws.cell(r, 6),  ms["max_drawdown"], reverse=True)
-            # 超额收益着色
-            self._color_cell(ws.cell(r, 14), excess_annual)
+            # 交易胜率着色（>50% 为好）
+            tw = ms.get("trade_win_rate")
+            if tw is not None and not (isinstance(tw, float) and np.isnan(tw)):
+                self._color_cell(ws.cell(r, 10), tw - 0.5)
+            # 赔率着色（>1 为好）
+            od = ms.get("odds_ratio")
+            if od is not None and not (isinstance(od, float) and np.isnan(od)):
+                self._color_cell(ws.cell(r, 12), od - 1.0)
+            # 超额胜率着色（>50% 为好）
+            ew = ms.get("excess_win_rate")
+            if ew is not None and not (isinstance(ew, float) and np.isnan(ew)):
+                self._color_cell(ws.cell(r, 13), ew - 0.5)
+            # 超额年化收益着色
+            self._color_cell(ws.cell(r, 18), excess_annual)
 
         self._auto_width(ws)
 
@@ -713,7 +867,7 @@ def plot_multi_factor_comparison(results: List[Tuple], save_path: Path) -> None:
         wrs = []
         for name in names:
             ev = evs[name]
-            res = (ev._signal_results or {}).get(m)
+            res = (ev._signal_results or {}).get(m, [None])[0]
             wrs.append(res.overall_win_rate * 100 if res else 50.0)
         ax.bar(x + j * w, wrs, w, label=ml, alpha=0.85)
     ax.axhline(50, color="#E53935", linewidth=1.2, linestyle="--", label="50%基准")
@@ -729,7 +883,7 @@ def plot_multi_factor_comparison(results: List[Tuple], save_path: Path) -> None:
     composites = [scores[n].composite_score for n in names]
     bars = ax.bar(range(len(names)), composites,
                   color=[colors[i] for i in range(n)], alpha=0.85, edgecolor="black")
-    ax.axhline(0.60, color="#43A047", linewidth=1.2, linestyle="--", label="B级（0.60）")
+    ax.axhline(0.45, color="#43A047", linewidth=1.2, linestyle="--", label="B-级（0.45）")
     ax.axhline(0.75, color="#1565C0", linewidth=1.2, linestyle="--", label="A级（0.75）")
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, fontsize=9, rotation=15)
@@ -757,25 +911,25 @@ def main() -> None:
     ROOT = Path(__file__).parent
 
     # ── 加载配置 ─────────────────────────────────────────────────────────────
-    cfg = load_config(ROOT / "config.yaml")
+    cfg = load_config(ROOT / "config.yaml") # -> cfg: dict
 
-    asset_cfg  = cfg.get("asset",      {})
-    sig_cfg    = cfg.get("signals",    {})
-    eval_cfg   = cfg.get("evaluation", {})
-    bt_cfg     = cfg.get("backtest",   {})
-    out_cfg    = cfg.get("output",     {})
+    asset_cfg  = cfg.get("asset",      {}) # -> asset_cfg: dict
+    sig_cfg    = cfg.get("signals",    {}) # -> sig_cfg: dict
+    eval_cfg   = cfg.get("evaluation", {}) # -> eval_cfg: dict
+    bt_cfg     = cfg.get("backtest",   {}) # -> bt_cfg: dict
+    out_cfg    = cfg.get("output",     {}) # -> out_cfg: dict
 
-    asset_name  = asset_cfg.get("name",        "未知资产")
-    asset_code  = asset_cfg.get("code",        "")
-    price_field = asset_cfg.get("price_field", "CLOSE")
+    asset_name  = asset_cfg.get("name",        "未知资产") # -> asset_name: str
+    asset_code  = asset_cfg.get("code",        "") # -> asset_code: str
+    price_field = asset_cfg.get("price_field", "CLOSE") # -> price_field: str
 
-    workspace        = ROOT / out_cfg.get("workspace_dir", "workspace")
-    eval_subdir      = out_cfg.get("eval_plots_subdir",    "plots/eval")
-    bt_subdir        = out_cfg.get("backtest_plots_subdir", "plots/backtest")
-    excel_filename   = out_cfg.get("excel_filename",       "timing_report.xlsx")
-    dpi              = int(out_cfg.get("dpi", 100))
+    workspace        = ROOT / out_cfg.get("workspace_dir", "workspace") # -> workspace: Path_str
+    eval_subdir      = out_cfg.get("eval_plots_subdir",    "plots/eval") # -> eval_subdir: Path_str
+    bt_subdir        = out_cfg.get("backtest_plots_subdir", "plots/backtest") # -> bt_subdir: Path_str
+    excel_filename   = out_cfg.get("excel_filename",       "timing_report.xlsx") # -> excel_filename: Path_str
+    dpi              = int(out_cfg.get("dpi", 100)) # -> dpi: int
 
-    workspace.mkdir(parents=True, exist_ok=True)
+    workspace.mkdir(parents=True, exist_ok=True) #创立文件夹
 
     print("=" * 68)
     print("  择时因子评价框架  |  主程序启动")
@@ -784,18 +938,18 @@ def main() -> None:
 
     # ── 加载数据 ─────────────────────────────────────────────────────────────
     print("\n[Step 1] 加载数据...")
-    data_cfg    = cfg.get("data", {})
-    price_file  = data_cfg.get("price_file",  "price_df.csv")
-    signal_file = data_cfg.get("signal_file", "signal.csv")
-    price_df, signal_df = load_data(ROOT / "data_ini", price_file, signal_file)
+    data_cfg    = cfg.get("data", {}) # -> data_cfg: dict
+    price_file  = data_cfg.get("price_file",  "price_df.csv") # -> price_file: Path_str
+    signal_file = data_cfg.get("signal_file", "signal.csv") # -> signal_file: Path_str
+    price_df, signal_df = load_data(ROOT / "data_ini", price_file, signal_file) # -> price_df: DataFrame, signal_df: DataFrame
 
-    prices  = extract_price_series(price_df, asset_code, price_field)
-    returns = prices.pct_change().dropna()
+    prices  = extract_price_series(price_df, asset_code, price_field) # -> prices: Series
+    returns = prices.pct_change().dropna() # -> returns: Series
 
     # ── 日期范围过滤 ─────────────────────────────────────────────────────────
-    start_date = data_cfg.get("start_date", "") or None
-    end_date   = data_cfg.get("end_date",   "") or None
-    if start_date or end_date:
+    start_date = data_cfg.get("start_date", "") or None # -> start_date: str or None
+    end_date   = data_cfg.get("end_date",   "") or None # -> end_date: str or None
+    if start_date or end_date: # 如果有开始或结束日期，则切片价格和信号表
         prices  = prices.loc[start_date:end_date]
         returns = returns.loc[start_date:end_date]
         sig_df_raw = signal_df.loc[start_date:end_date]
@@ -804,8 +958,8 @@ def main() -> None:
     else:
         sig_df_raw = signal_df
 
-    sig_selected = select_signals(sig_df_raw, sig_cfg)
-    signal_names = list(sig_selected.columns)
+    sig_selected = select_signals(sig_df_raw, sig_cfg) #sig_selected: DataFrame 从信号表格中找到config中指定的信号
+    signal_names = list(sig_selected.columns) # -> signal_names: list ->[str] 所有信号的名称
 
     print(f"  价格序列  ：{prices.index[0].date()} → {prices.index[-1].date()}"
           f"（共 {len(prices)} 条）")
@@ -813,38 +967,51 @@ def main() -> None:
 
     # ── 逐信号评估与回测 ─────────────────────────────────────────────────────
     print("\n[Step 2] 逐信号评估与回测...")
-    backtester = Backtester(bt_cfg)
-    all_results: List[Tuple] = []   # [(sig_name, evaluator, BacktestResult)]
+    backtester = Backtester(bt_cfg) # -> backtester: Backtester对象
+    all_results: List[Tuple] = []   # -> all_results: list ->[(sig_name, evaluator, BacktestResult)] 每个信号的回测结果
 
     for sig_name in signal_names:
         print(f"\n  ── {sig_name} {'─' * (52 - len(sig_name))}")
-        raw_signal = sig_selected[sig_name].dropna()
+        raw_signal = sig_selected[sig_name].dropna() # -> raw_signal: Series 信号序列（删除缺失值）
+
+        # ── 频率感知数据准备 ──────────────────────────────────────────
+        # 自动检测信号频率，分离评估（信号自然频率）与回测（日度前向填充）
+        eval_signal, eval_prices, eval_returns, eval_window, freq_label, median_gap = \
+            _prepare_eval_data(raw_signal, prices,
+                               int(eval_cfg.get("rolling_window", 252)))
+        is_lowfreq = (median_gap > 2)
+        if is_lowfreq:
+            print(f"  信号频率  ：{freq_label}（检测间隔≈{median_gap}交易日）")
+            print(f"  评估模式  ：降频期间收益（{len(eval_signal)}条）| 回测前向填充至日度")
+            print(f"  滚动窗口  ：{int(eval_cfg.get('rolling_window', 252))}交易日 → 调整为{eval_window}期")
+        else:
+            print(f"  信号频率  ：{freq_label}")
 
         # 每个信号独立输出目录：workspace/{safe_name}/
-        safe_name  = sig_name.replace("/", "_").replace(" ", "_").replace("\\", "_")
-        sig_dir    = workspace / safe_name
-        eval_dir   = sig_dir / eval_subdir
-        bt_dir     = sig_dir / bt_subdir
-        excel_path = sig_dir / excel_filename
+        safe_name  = sig_name.replace("/", "_").replace(" ", "_").replace("\\", "_") # -> safe_name: str 安全的文件名
+        sig_dir    = workspace / safe_name # -> sig_dir: Path_str 信号目录
+        eval_dir   = sig_dir / eval_subdir # -> eval_dir: Path_str 评估目录
+        bt_dir     = sig_dir / bt_subdir # -> bt_dir: Path_str 回测目录
+        excel_path = sig_dir / excel_filename # -> excel_path: Path_str Excel文件路径
         eval_dir.mkdir(parents=True, exist_ok=True)
         bt_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── 因子评估 ──────────────────────────────────────────────────────
+        # ── 因子评估（使用信号自然频率数据，避免重复计数）────────────
         ev = TimingFactorEvaluator(
             factor_name   = sig_name,
             forward_period= int(eval_cfg.get("forward_period", 1)),
             ic_method     = eval_cfg.get("ic_method", "pearson"),
-        )
+        ) # -> ev: TimingFactorEvaluator对象
         ev.evaluate(
-            factor                = raw_signal,
-            returns               = returns,
-            prices                = prices,
+            factor                = eval_signal,
+            returns               = eval_returns,
+            prices                = eval_prices,
             preprocess            = bool(eval_cfg.get("preprocess", True)),
-            rolling_window        = int(eval_cfg.get("rolling_window", 252)),
+            rolling_window        = eval_window,
             run_robustness        = bool(eval_cfg.get("run_robustness", True)),
             run_rolling_regression= bool(eval_cfg.get("run_rolling_regression", False)),
             ic_periods            = eval_cfg.get("ic_periods", [1, 5, 10, 20]),
-        )
+        ) # 对于一个信号进行打分，包含五个方面，IC评分，信号评分，回归评分和稳健性评分
 
         # 打印评估报告（控制台）
         ev.report()
@@ -856,15 +1023,42 @@ def main() -> None:
         plt.close(fig)
         print(f"  ✓ 评估图：{eval_plot_path.relative_to(workspace)}")
 
-        # ── 回测 ──────────────────────────────────────────────────────────
-        factor_for_bt = ev._factor if ev._factor is not None else raw_signal
+        # ── 回测用信号：前向填充到日度价格日历 ───────────────────────
+        # 取预处理后的稀疏信号（或原始稀疏信号），前向填充到每个交易日
+        preprocessed_sparse = ev._factor if ev._factor is not None else eval_signal
+        if is_lowfreq:
+            # 低频信号：前向填充到日度（持仓直到下一个信号更新）
+            factor_for_bt = preprocessed_sparse.reindex(prices.index, method="ffill")
+        else:
+            # 日度信号：直接用（已在日度价格日历上）
+            factor_for_bt = preprocessed_sparse
         bt_res = backtester.run(
             signal      = factor_for_bt,
             prices      = prices,
             signal_name = sig_name,
             save_dir    = bt_dir,
-        )
+        ) # -> bt_res: BacktestResult对象 回测结果
         print(bt_res.summary())
+
+        # ── 仓位表 ────────────────────────────────────────────────────────
+        # 对齐信号值与仓位序列的共同索引
+        common_idx = bt_res.positions.index
+        pos_table = pd.DataFrame(
+            {
+                "信号值":       factor_for_bt.reindex(common_idx),
+                "仓位":         bt_res.positions.map({0.0: "空仓", 1.0: "持仓"}),
+                "仓位数值":     bt_res.positions,
+                "策略日收益":   bt_res.strategy_returns,
+                "基准日收益":   bt_res.benchmark_returns,
+                "策略累计净值": (1 + bt_res.strategy_returns).cumprod(),
+                "基准累计净值": (1 + bt_res.benchmark_returns).cumprod(),
+            },
+            index=common_idx,
+        )
+        pos_table.index.name = "日期"
+        pos_path = sig_dir / "position_table.csv"
+        pos_table.to_csv(pos_path, encoding="utf-8-sig")   # utf-8-sig 保证 Excel 直接打开不乱码
+        print(f"  ✓ 仓位表：{pos_path.relative_to(workspace)}")
 
         # ── 单信号 Excel 报告 ──────────────────────────────────────────────
         ExcelReporter().write(
@@ -892,6 +1086,7 @@ def main() -> None:
         print(f"  ├── {safe}/")
         print(f"  │   ├── {eval_subdir}/   （评估图）")
         print(f"  │   ├── {bt_subdir}/  （回测图）")
+        print(f"  │   ├── position_table.csv  （仓位表）")
         print(f"  │   └── {excel_filename}")
     print(f"  └── factor_comparison.png   （多信号对比图）")
     print()

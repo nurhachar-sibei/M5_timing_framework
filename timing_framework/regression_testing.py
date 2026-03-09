@@ -169,8 +169,10 @@ class RegressionTester:
             )
 
         X = df["f"].values
-        y = df["r"].values
-
+        y = df["r"].values*100
+        # print("@@@@@@@@@@@@@@@@@@@@@")
+        # print(X)
+        # print(y)
         if self._use_statsmodels:
             return self._fit_statsmodels(X, y, df.index)
         else:
@@ -185,6 +187,7 @@ class RegressionTester:
 
         X_const = sm.add_constant(X)
         model = sm.OLS(y, X_const).fit()
+
 
         return RegressionResult(
             alpha=float(model.params[0]),

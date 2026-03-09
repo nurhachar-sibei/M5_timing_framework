@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from doctest import DocFileSuite
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -181,11 +182,9 @@ def calculate_rolling_ic(
         滚动 IC 序列，前 `rolling_window` 个值为 NaN。
     """
     fwd_returns = returns.shift(-forward_period)
-    df = pd.DataFrame({"f": factor, "r": fwd_returns})
-
+    df = pd.DataFrame({"f": factor, "r": fwd_returns}).dropna()
     ic_values = pd.Series(index=factor.index, dtype=float)
-
-    for i in range(rolling_window, len(df)):
+    for i in range(rolling_window, len(df)-1):
         window_data = df.iloc[i - rolling_window : i].dropna()
         # 数据量不足窗口的四分之一时跳过，避免噪声过大
         if len(window_data) < max(5, rolling_window // 4):
@@ -195,9 +194,7 @@ def calculate_rolling_ic(
             ic, _ = stats.spearmanr(window_data["f"], window_data["r"])
         else:
             ic, _ = stats.pearsonr(window_data["f"], window_data["r"])
-
         ic_values.iloc[i] = ic
-
     return ic_values
 
 
@@ -243,7 +240,7 @@ class CorrelationTester:
         forward_period : int
             预测周期（天数）。
         rolling_window : int 或 None
-            滚动 IC 窗口。默认 min(60, n_obs/6)，最小 20。
+            滚动 IC 窗口。默认 min(60, n_obs/6)，最小 25。
 
         返回
         ----
@@ -251,7 +248,7 @@ class CorrelationTester:
         """
         n_obs = factor.dropna().shape[0]
         if rolling_window is None:
-            rolling_window = max(20, min(60, n_obs // 6))
+            rolling_window = max(25, min(60, n_obs // 6))
 
         ic_series = calculate_rolling_ic(
             factor, returns, forward_period, rolling_window, self.method

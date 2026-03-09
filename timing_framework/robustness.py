@@ -168,12 +168,12 @@ class RobustnessTester:
         oos_ic_res = self._ic_tester.run_test(oos_factor, oos_returns, self.forward_period)
 
         # 分别计算阈值信号胜率
-        is_sig = self._sig_tester.run_threshold_test(is_factor, is_returns)
-        oos_sig = self._sig_tester.run_threshold_test(oos_factor, oos_returns)
+        is_sig = self._sig_tester.run_threshold_test(is_factor, is_returns)[0]
+        oos_sig = self._sig_tester.run_threshold_test(oos_factor, oos_returns)[0]
 
         ic_in = is_ic_res.ic_mean
         ic_out = oos_ic_res.ic_mean
-        ic_deg = (ic_in - ic_out) / abs(ic_in) if ic_in != 0 else 0.0
+        ic_deg = (ic_out - ic_in) / abs(ic_in) if ic_in != 0 else 0.0
 
         # 稳健性判断：方向一致 且 衰减 < 50%
         is_robust = (
@@ -235,7 +235,7 @@ class RobustnessTester:
             try:
                 factor = factor_func(**full_params)
                 ic_res = self._ic_tester.run_test(factor, returns, self.forward_period)
-                sig_res = self._sig_tester.run_threshold_test(factor, returns)
+                sig_res = self._sig_tester.run_threshold_test(factor, returns)[0]
 
                 records.append(
                     {

@@ -112,11 +112,11 @@ class Backtester:
 
     def __init__(self, config: dict) -> None:
         self.cfg              = config
-        self.long_threshold   = float(config.get("long_threshold",  0.0))
-        self.short_threshold  = float(config.get("short_threshold", 0.0))
-        self.risk_free_rate   = float(config.get("risk_free_rate",  0.03))
-        self.transaction_cost = float(config.get("transaction_cost", 0.001))
-        self.benchmark_ratio  = float(config.get("benchmark_asset_ratio", 0.5))
+        self.long_threshold   = float(config.get("long_threshold",  0.0)) #self.long_threshold: float
+        self.short_threshold  = float(config.get("short_threshold", 0.0)) #self.short_threshold: float
+        self.risk_free_rate   = float(config.get("risk_free_rate",  0.03)) #self.risk_free_rate: float
+        self.transaction_cost = float(config.get("transaction_cost", 0.001)) #self.transaction_cost: float
+        self.benchmark_ratio  = float(config.get("benchmark_asset_ratio", 0.5)) #self.benchmark_ratio: float
 
     # ─────────────────────────────────────────────────────────────────────────
     # 仓位生成
@@ -128,15 +128,15 @@ class Backtester:
 
         规则：
         - signal > long_threshold  → 仓位 = 1.0（全仓做多）
-        - signal < -short_threshold → 仓位 = 0.0（空仓）
+        - signal < short_threshold → 仓位 = 0.0（空仓）
         - 其他情况                → 前向填充，保持上一期仓位
 
         返回的仓位序列延迟一个交易日（t 日信号用于 t+1 日持仓），
         以避免当日信号当日交易的未来信息泄漏。
         """
         pos = pd.Series(np.nan, index=signal.index, name="position")
-        pos[signal >  self.long_threshold]  = 1.0
-        pos[signal < -self.short_threshold] = 0.0
+        pos[signal > self.long_threshold]  = 1.0
+        pos[signal <= self.short_threshold] = 0.0
         # 前向填充中性区间，初始默认空仓
         pos = pos.ffill().fillna(0.0)
         # 延迟一期（t 日信号 → t+1 日仓位）
@@ -226,6 +226,62 @@ class Backtester:
     def _count_trades(self, positions: pd.Series) -> int:
         """统计换仓次数（仓位从 0→1 或 1→0 的次数）。"""
         return int((positions.diff().fillna(0) != 0).sum())
+
+    def _compute_extended_metrics(self,
+                                   positions: pd.Series,
+                                   strategy_returns: pd.Series,
+                                   benchmark_returns: pd.Series) -> Dict:
+        """
+        计算四项扩展绩效指标。
+
+        返回字段
+        --------
+        trade_win_rate  : 交易胜率（完整开平仓交易中收益率>0的比例）
+        holding_ratio   : 持有时间占比（持仓天数/总天数）
+        odds_ratio      : 赔率（均盈利 / 均亏损绝对值）
+        excess_win_rate : 超额胜率（策略日收益 > 基准日收益的比例）
+        """
+        # ── 持有时间占比 ──────────────────────────────────────────────────
+        holding_ratio = float((positions > 0).mean())
+
+        # ── 赔率 ──────────────────────────────────────────────────────────
+        pos_rets = strategy_returns[strategy_returns > 0]
+        neg_rets = strategy_returns[strategy_returns < 0]
+        if len(pos_rets) > 0 and len(neg_rets) > 0 and abs(neg_rets.mean()) > 1e-10:
+            odds_ratio = float(pos_rets.mean() / abs(neg_rets.mean()))
+        else:
+            odds_ratio = float("nan")
+
+        # ── 超额胜率 ──────────────────────────────────────────────────────
+        bench_aligned = benchmark_returns.reindex(strategy_returns.index).fillna(0.0)
+        excess_win_rate = float((strategy_returns > bench_aligned).mean())
+
+        # ── 交易胜率：识别完整开平仓交易区间 ─────────────────────────────
+        pos_diff = positions.diff().fillna(0)
+        entries  = pos_diff[pos_diff > 0].index.tolist()
+        exits    = pos_diff[pos_diff < 0].index.tolist()
+
+        trade_returns = []
+        for entry in entries:
+            # 找该 entry 之后的第一个 exit
+            future_exits = [e for e in exits if e > entry]
+            if future_exits:
+                exit_date = future_exits[0]
+                seg = strategy_returns.loc[entry:exit_date]
+                trade_returns.append(float((1 + seg).prod() - 1))
+            # 最后一笔未平仓的交易不纳入统计
+
+        if trade_returns:
+            trade_win_rate = float(np.mean([r > 0 for r in trade_returns]))
+        else:
+            trade_win_rate = float("nan")
+
+        return {
+            "trade_win_rate":  trade_win_rate,
+            "holding_ratio":   holding_ratio,
+            "odds_ratio":      odds_ratio,
+            "excess_win_rate": excess_win_rate,
+        }
 
     # ─────────────────────────────────────────────────────────────────────────
     # 图1：买卖点分析图
@@ -456,7 +512,7 @@ class Backtester:
         ax = axes[2]
         daily_rf  = self.risk_free_rate / self._ANNUAL
         excess_r  = strategy_returns - daily_rf
-        win       = 63  # 约3个月
+        win       = 60  # 约3个月
         roll_sharpe = (
             excess_r.rolling(win).mean()
             / excess_r.rolling(win).std()
@@ -527,7 +583,8 @@ class Backtester:
         m_strat   = self.performance_metrics(strat_ret, "择时策略", n_trades)
         m_bench   = self.performance_metrics(bench_ret, "基准")
         m_bh      = self.performance_metrics(bh_ret,   "纯持有")
-
+        # 扩展指标（交易胜率、持有时间占比、赔率、超额胜率）
+        m_strat.update(self._compute_extended_metrics(pos, strat_ret, bench_ret))
         # 文件安全名（替换特殊字符）
         safe = signal_name.replace("/", "_").replace(" ", "_").replace("\\", "_")
 
@@ -537,7 +594,7 @@ class Backtester:
             signal_name=signal_name,
             save_path=save_dir / f"{safe}_01_buy_sell.png",
         )
-
+        
         # 图2：策略 vs 基准对比图
         self.plot_strategy_vs_benchmark(
             strategy_returns=strat_ret,

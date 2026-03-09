@@ -258,6 +258,53 @@ def generate_percentile_signals(
     return signals
 
 
+def generate_zero_signals(factor: pd.Series) -> pd.Series:
+    """
+    零值法信号生成。
+
+    因子值小于等于 0 时 → 空仓（0）；
+    因子值大于 0 时 → 多头（+1）。
+
+    参数
+    ----
+    factor : pd.Series
+        因子序列。
+
+    返回
+    ----
+    pd.Series
+        整数信号序列：+1、0 。
+    """
+    signals = pd.Series(-1, index=factor.index, dtype=int)
+    signals[factor > 0] = 1
+    return signals
+
+
+
+def generate_diff_zero_signals(factor: pd.Series) -> pd.Series:
+    """
+    零值法（因子差）信号生成。
+
+    因子值小于等于 0 时 → 空仓（0）；
+    因子值大于 0 时 → 多头（+1）。
+
+    参数
+    ----
+    factor : pd.Series
+        因子序列。
+
+    返回
+    ----
+    pd.Series
+        整数信号序列：+1、0 。
+    """
+    factor = factor.diff()
+    signals = pd.Series(-1, index=factor.index, dtype=int)
+    signals[factor > 0] = 1
+    return signals
+
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 信号评估函数
 # ══════════════════════════════════════════════════════════════════════════════
@@ -417,7 +464,7 @@ class SignalTester:
         """阈值法信号检验。"""
         fwd = returns.shift(-self.forward_period)
         signals = generate_threshold_signals(factor, upper, lower)
-        return evaluate_signals(signals, fwd)
+        return [evaluate_signals(signals, fwd),signals]
 
     def run_ma_test(
         self,
@@ -428,7 +475,7 @@ class SignalTester:
         """均线法信号检验。"""
         fwd = returns.shift(-self.forward_period)
         signals = generate_ma_signals(factor, window)
-        return evaluate_signals(signals, fwd)
+        return [evaluate_signals(signals, fwd),signals]
 
     def run_percentile_test(
         self,
@@ -441,7 +488,29 @@ class SignalTester:
         """极值法（历史分位数）信号检验。"""
         fwd = returns.shift(-self.forward_period)
         signals = generate_percentile_signals(factor, lower_pct, upper_pct, window)
-        return evaluate_signals(signals, fwd)
+        return [evaluate_signals(signals, fwd),signals]
+
+    def run_zero_test(
+        self,
+        factor: pd.Series,
+        returns: pd.Series,
+    ) -> SignalTestResult:
+        """零值法信号检验。"""
+        fwd = returns.shift(-self.forward_period)
+        signals = generate_zero_signals(factor)
+        return [evaluate_signals(signals, fwd),signals]
+
+    def run_diff_zero_test(
+        self,
+        factor: pd.Series,
+        returns: pd.Series,
+    ) -> SignalTestResult:
+        """零值法（因子差）信号检验。"""
+        fwd = returns.shift(-self.forward_period)
+        signals = generate_diff_zero_signals(factor)
+        return [evaluate_signals(signals, fwd),signals]
+
+
 
     def run_all(
         self,
@@ -460,7 +529,7 @@ class SignalTester:
         返回
         ----
         dict
-            键：'threshold'（阈值法）、'moving_average'（均线法）、'percentile'（极值法）。
+            键：'threshold'（阈值法）、'moving_average'（均线法）、'percentile'（极值法）、'zero'（零值法）。
         """
         return {
             "threshold": self.run_threshold_test(
@@ -470,4 +539,7 @@ class SignalTester:
             "percentile": self.run_percentile_test(
                 factor, returns, pct_lower, pct_upper, pct_window
             ),
+            "zero": self.run_zero_test(factor, returns),
+            "diff_zero": self.run_diff_zero_test(factor, returns),
+            'MA250_diff_zero': self.run_diff_zero_test(factor.rolling(250).mean(), returns),
         }

@@ -138,7 +138,7 @@ class TimingFactorEvaluator:
     """
 
     # 各维度评分权重
-    _SCORE_WEIGHTS = {"ic": 0.30, "signal": 0.30, "regression": 0.20, "robustness": 0.20}
+    _SCORE_WEIGHTS = {"ic": 0.35, "signal": 0.35, "regression": 0.15, "robustness": 0.15}
 
     def __init__(
         self,
@@ -214,8 +214,8 @@ class TimingFactorEvaluator:
         self
             支持链式调用。
         """
-        self._returns = returns
-        self._prices = prices
+        self._returns = returns # -> self._returns: pd.Series 
+        self._prices = prices # -> self._prices: pd.Series 
 
         # ─── 1. 因子预处理 ─────────────────────────────────────────────
         if preprocess:
@@ -224,9 +224,12 @@ class TimingFactorEvaluator:
                 winsorize=True,
                 standardize=True,
                 rolling_window=rolling_window,
-            )
+            ) # -> self._factor: pd.Series 预处理后的因子序列
         else:
-            self._factor = factor.copy()
+            self._factor = factor.copy() # -> self._factor: pd.Series 预处理后的因子序列
+        # print("@@@@@@@@@@@@@@@@")
+        # print(preprocess)
+        # print(self._factor.describe())
 
         # ─── 2. 信号检验 ────────────────────────────────────────────────
         self._signal_results = self._signal_tester.run_all(
@@ -235,6 +238,7 @@ class TimingFactorEvaluator:
 
         # ─── 3. IC / ICIR 检验 ─────────────────────────────────────────
         _ic_periods = ic_periods or [1, 5, 10, 20]
+        
         self._ic_results = self._ic_tester.run_multi_period(
             self._factor, returns, periods=_ic_periods
         )
@@ -303,18 +307,37 @@ class TimingFactorEvaluator:
         # ── 信号评分：胜率 + 显著性加分 ────────────────────────────
         signal_score = 0.0
         if self._signal_results:
-            thr = self._signal_results.get("threshold")
-            if thr:
-                # 胜率在 [0.50, 0.70] 区间线性映射到 [0, 1]
-                wr_score = min(1.0, max(0.0, (thr.overall_win_rate - 0.50) / 0.20))
-                sig_bonus = 0.20 if thr.is_significant else 0.0
-                signal_score = min(1.0, wr_score + sig_bonus)
+            # # key_in_signal_results = self.
+            # thr = self._signal_results.get("threshold")
+            # if thr:
+            #     # 胜率在 [0.50, 0.70] 区间线性映射到 [0, 1]
+            #     wr_score = min(1.0, max(0.0, (thr.overall_win_rate - 0.50) / 0.20))
+            #     sig_bonus = 0.20 if thr.is_significant else 0.0
+            #     signal_score = min(1.0, wr_score + sig_bonus)
+
+            key_in_signal_results = self._signal_results.keys()
+            signal_score_dict = {}
+            for key in key_in_signal_results:
+                sig_ = self._signal_results.get(key, {})[0]
+                if sig_:
+                    # 胜率在 [0.50, 0.70] 区间线性映射到 [0, 1]
+                    wr_score = min(1.0, max(0.0, (sig_.overall_win_rate - 0.50) / 0.20))
+                    sig_bonus = 0.40 if sig_.is_significant else 0.2
+                    signal_score_dict[key] = min(1.0, wr_score + sig_bonus)
+
+            signal_score = max(signal_score_dict.values())
+            self.best_method = max(signal_score_dict, key=signal_score_dict.get)
+            self.best_signal = self._signal_results.get(self.best_method, [None])[1]
+            # print(f"信号评分：{signal_score}，最佳方法：{self.best_method}")
+            # print(f"最佳信号：{self.best_signal}")
+
+
 
         # ── 回归评分：β 显著性 + R² 加分 ───────────────────────────
         regression_score = 0.0
         if self._reg_result:
             base = 0.50 if self._reg_result.is_significant else 0.10
-            r2_bonus = min(0.50, self._reg_result.r_squared * 10)
+            r2_bonus = min(0.50, self._reg_result.r_squared * 20)
             regression_score = min(1.0, base + r2_bonus)
 
         # ── 稳健性评分：OOS 同向 + 衰减程度 ────────────────────────
@@ -337,10 +360,11 @@ class TimingFactorEvaluator:
 
         grade = (
             "A" if composite >= 0.75
-            else "B" if composite >= 0.60
-            else "C" if composite >= 0.45
-            else "D" if composite >= 0.30
-            else "F"
+            else "A-" if composite >= 0.60
+            else "B" if composite >= 0.50
+            else "B-" if composite >= 0.45
+            else "C" if composite >= 0.30
+            else "D"
         )
 
         return FactorScore(
@@ -371,10 +395,13 @@ class TimingFactorEvaluator:
                 "threshold": "阈值法",
                 "moving_average": "均线法",
                 "percentile": "极值法",
+                "zero": "零值法",
+                "diff_zero": "差分零值法",
+                "MA250_diff_zero": "250日移动平均差分零值法",
             }
             label = label_map.get(method_name, method_name.upper())
             print(f"\n  [{label}]")
-            print(result.summary())
+            print(result[0].summary())
 
         # IC 检验
         print("\n── 2. 相关性检验法（IC / ICIR）─────────────────────────────")
@@ -513,7 +540,7 @@ class TimingFactorEvaluator:
         """绘制多空信号期间的平均收益率柱形图。"""
         if not self._signal_results or "threshold" not in self._signal_results:
             return
-        r = self._signal_results["threshold"]
+        r = self._signal_results["threshold"][0]
         vals = [r.long_avg_return * 100, r.short_avg_return * 100]
         colors = ["#4CAF50" if v > 0 else "#F44336" for v in vals]
         bars = ax.bar(["多头信号", "空头信号"], vals, color=colors,
@@ -532,7 +559,7 @@ class TimingFactorEvaluator:
         methods = list(self._signal_results.keys())
         method_labels = {"threshold": "阈值法", "moving_average": "均线法", "percentile": "极值法"}
         labels = [method_labels.get(m, m) for m in methods]
-        win_rates = [self._signal_results[m].overall_win_rate * 100 for m in methods]
+        win_rates = [self._signal_results[m][0].overall_win_rate * 100 for m in methods]
         colors = ["#4CAF50" if wr > 50 else "#F44336" for wr in win_rates]
         ax.bar(range(len(methods)), win_rates, color=colors, alpha=0.8,
                edgecolor="black", linewidth=0.5)
