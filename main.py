@@ -466,9 +466,9 @@ class ExcelReporter:
 
             # 取各指标
             ic1 = (ev._ic_results or {}).get(ev.forward_period)
-            sig1 = (ev._signal_results or {}).get("threshold")[0]
-            sig2 = (ev._signal_results or {}).get("moving_average")[0]
-            sig3 = (ev._signal_results or {}).get("percentile")[0]
+            sig1 = (ev._signal_results or {}).get("threshold")
+            sig2 = (ev._signal_results or {}).get("moving_average")
+            sig3 = (ev._signal_results or {}).get("percentile")
             reg  = ev._reg_result
             rob  = ev._robustness_result
             sc   = ev.score()
@@ -476,9 +476,9 @@ class ExcelReporter:
             ic_mean   = ic1.ic_mean           if ic1  else None
             icir      = ic1.icir              if ic1  else None
             ic_pos_r  = ic1.ic_positive_ratio if ic1  else None
-            wr1 = sig1.overall_win_rate if sig1 else None
-            wr2 = sig2.overall_win_rate if sig2 else None
-            wr3 = sig3.overall_win_rate if sig3 else None
+            wr1 = sig1.full.overall_win_rate if sig1 else None
+            wr2 = sig2.full.overall_win_rate if sig2 else None
+            wr3 = sig3.full.overall_win_rate if sig3 else None
             beta      = reg.beta       if reg  else None
             beta_sig  = "显著" if (reg and reg.is_significant) else "不显著"
             r2        = reg.r_squared  if reg  else None
@@ -559,6 +559,9 @@ class ExcelReporter:
             "多头样本数", "多头胜率", "多头均收益", "多头盈亏比",
             "空头样本数", "空头胜率", "空头均收益", "空头盈亏比",
             "综合胜率", "多空收益价差", "T统计量", "P值", "是否显著",
+            "切分日期",
+            "IS多头胜率", "IS多头盈亏比",
+            "OOS多头胜率", "OOS多头盈亏比",
         ]
         self._write_header_row(ws, row=1, cols=headers)
 
@@ -572,28 +575,36 @@ class ExcelReporter:
         for sig_name, ev, _ in results:
             for method, res in (ev._signal_results or {}).items():
                 alt = (row % 2 == 0)
+                full = res.full
+                # IS/OOS 数据
+                split_d = str(res.split_date)[:10] if res.split_date else "N/A"
+                is_lwr  = self._pct(res.insample.long_win_rate)  if res.insample  else "N/A"
+                is_lpl  = self._f4(res.insample.long_pl_ratio)   if res.insample  else "N/A"
+                oos_lwr = self._pct(res.outsample.long_win_rate) if res.outsample else "N/A"
+                oos_lpl = self._f4(res.outsample.long_pl_ratio)  if res.outsample else "N/A"
                 values = [
                     sig_name, method_label.get(method, method),
-                    res[0].n_long,
-                    self._pct(res[0].long_win_rate),
-                    self._f4(res[0].long_avg_return),
-                    self._f4(res[0].long_pl_ratio),
-                    res[0].n_short,
-                    self._pct(res[0].short_win_rate),
-                    self._f4(res[0].short_avg_return),
-                    self._f4(getattr(res[0], "short_pl_ratio", None)),
-                    self._pct(res[0].overall_win_rate),
-                    self._f4(res[0].long_short_return_spread),
-                    self._f4(res[0].t_statistic),
-                    self._f4(res[0].p_value),
-                    "✓ 显著" if res[0].is_significant else "✗ 不显著",
+                    full.n_long,
+                    self._pct(full.long_win_rate),
+                    self._f4(full.long_avg_return),
+                    self._f4(full.long_pl_ratio),
+                    full.n_short,
+                    self._pct(full.short_win_rate),
+                    self._f4(full.short_avg_return),
+                    self._f4(getattr(full, "short_pl_ratio", None)),
+                    self._pct(full.overall_win_rate),
+                    self._f4(full.long_short_return_spread),
+                    self._f4(full.t_statistic),
+                    self._f4(full.p_value),
+                    "✓ 显著" if full.is_significant else "✗ 不显著",
+                    split_d,
+                    is_lwr, is_lpl,
+                    oos_lwr, oos_lpl,
                 ]
                 self._write_data_row(ws, row=row, values=values, alt=alt)
                 # 胜率着色
-                self._color_cell(ws.cell(row, 4),
-                                  res[0].long_win_rate - 0.5)
-                self._color_cell(ws.cell(row, 11),
-                                  res[0].overall_win_rate - 0.5)
+                self._color_cell(ws.cell(row, 4), full.long_win_rate - 0.5)
+                self._color_cell(ws.cell(row, 11), full.overall_win_rate - 0.5)
                 row += 1
 
         self._auto_width(ws)
@@ -867,8 +878,8 @@ def plot_multi_factor_comparison(results: List[Tuple], save_path: Path) -> None:
         wrs = []
         for name in names:
             ev = evs[name]
-            res = (ev._signal_results or {}).get(m, [None])[0]
-            wrs.append(res.overall_win_rate * 100 if res else 50.0)
+            res = (ev._signal_results or {}).get(m)
+            wrs.append(res.full.overall_win_rate * 100 if res else 50.0)
         ax.bar(x + j * w, wrs, w, label=ml, alpha=0.85)
     ax.axhline(50, color="#E53935", linewidth=1.2, linestyle="--", label="50%基准")
     ax.set_xticks(x + w)
@@ -1011,6 +1022,10 @@ def main() -> None:
             run_robustness        = bool(eval_cfg.get("run_robustness", True)),
             run_rolling_regression= bool(eval_cfg.get("run_rolling_regression", False)),
             ic_periods            = eval_cfg.get("ic_periods", [1, 5, 10, 20]),
+            signal_kwargs         = {
+                **eval_cfg.get("signal_params", {}),
+                "test_ratio": float(eval_cfg.get("signal_test_ratio", 0.30)),
+            },
         ) # 对于一个信号进行打分，包含五个方面，IC评分，信号评分，回归评分和稳健性评分
 
         # 打印评估报告（控制台）
@@ -1023,15 +1038,29 @@ def main() -> None:
         plt.close(fig)
         print(f"  ✓ 评估图：{eval_plot_path.relative_to(workspace)}")
 
-        # ── 回测用信号：前向填充到日度价格日历 ───────────────────────
-        # 取预处理后的稀疏信号（或原始稀疏信号），前向填充到每个交易日
-        preprocessed_sparse = ev._factor if ev._factor is not None else eval_signal
-        if is_lowfreq:
-            # 低频信号：前向填充到日度（持仓直到下一个信号更新）
-            factor_for_bt = preprocessed_sparse.reindex(prices.index, method="ffill")
+        # ── 回测用信号：优先使用评分最高方法的离散信号 ──────────────
+        # score() 在 report() 中已被调用，best_method/best_signal 已设置
+        # 若未设置则回退到连续因子值
+        _ = ev.score()  # 确保 best_method / best_signal 已填充
+        best_signal_sparse = getattr(ev, "best_signal", None)
+
+        if best_signal_sparse is not None:
+            best_method_name = getattr(ev, "best_method", "unknown")
+            print(f"  回测信号  ：最佳方法「{best_method_name}」的离散信号（+1/0/-1）")
+            if is_lowfreq:
+                factor_for_bt = (
+                    best_signal_sparse.reindex(prices.index, method="ffill")
+                    .fillna(0).astype(float)
+                )
+            else:
+                factor_for_bt = best_signal_sparse.fillna(0).astype(float)
         else:
-            # 日度信号：直接用（已在日度价格日历上）
-            factor_for_bt = preprocessed_sparse
+            # 回退：使用预处理后的连续因子值
+            preprocessed_sparse = ev._factor if ev._factor is not None else eval_signal
+            if is_lowfreq:
+                factor_for_bt = preprocessed_sparse.reindex(prices.index, method="ffill")
+            else:
+                factor_for_bt = preprocessed_sparse
         bt_res = backtester.run(
             signal      = factor_for_bt,
             prices      = prices,

@@ -4,37 +4,46 @@
 
 # ── 资产配置 ────────────────────────────────────────────────────
 asset:
-  name: "SP"            # 资产显示名称（用于报告标题）
-  code: "513500.SH"          # 资产代码（用于匹配 price_df.csv 中的列）
+  name: "M"            # 资产显示名称（用于报告标题）
+  code: "M.DCE"          # 资产代码（用于匹配 price_df.csv 中的列）
   price_field: "CLOSE"       # 价格字段名称
 
 # ── 数据文件配置 ────────────────────────────────────────────────
 data:
-  price_file: "price_sp.csv"   # data_ini/ 中的价格文件名
-  signal_file: "inifactor_sp.csv"    # data_ini/ 中的信号文件名
-  start_date: "2010-01-01"               # 信号测试起始日期，格式 YYYY-MM-DD，空字符串=不限制
-  end_date: "2025-01-01"                 # 信号测试结束日期，格式 YYYY-MM-DD，空字符串=不限制
+  price_file: "price_m.csv"   # data_ini/ 中的价格文件名
+  signal_file: "inifactor_m.csv"    # data_ini/ 中的信号文件名
+  start_date: "2015-06-17"               # 信号测试起始日期，格式 YYYY-MM-DD，空字符串=不限制
+  end_date: "2026-01-01"                 # 信号测试结束日期，格式 YYYY-MM-DD，空字符串=不限制
 
 # ── 信号配置 ────────────────────────────────────────────────────
 signals:
-  use_all: false          # true=使用信号文件所有列，false=使用 selected 列表
+  use_all: false        # true=使用信号文件所有列，false=使用 selected 列表
   selected:                  # use_all=false 时生效，填写需分析的信号列名
-    - "OAS"
-    # - "FINP"
+    - "m_store"
 
 # ── 因子评估参数 ─────────────────────────────────────────────────
 evaluation:
-  forward_period: 3         # 预测周期 #Cu:1 M:5  OIL:5 NH：5
+  forward_period: 5         # 预测周期 #Cu:1 M:5  OIL:5 NH：5
   ic_method: "pearson"       # IC计算方法：pearson / spearman
   rolling_window: 252        # 预处理滚动窗口（天，约1年）
   ic_periods:                # 多周期IC分析的预测天数
-    - 3
+    - 5
     - 5
     - 10
     - 20
   run_robustness: true       # 是否执行稳健性检验（样本内外 + 市场状态）
   run_rolling_regression: false  # 是否执行滚动回归（耗时较长，默认关闭）
-  preprocess: false         # 是否对信号做 MAD 去极值 + 滚动 Z-score 预处理
+  preprocess: true         # 是否对信号做 MAD 去极值 + 滚动 Z-score 预处理  #oas不做预处理
+  signal_test_ratio: 0.30   # 信号法样本内外切分比例（最后 N% 为样本外）
+  signal_params:             # 各信号法参数（留空则使用默认值）
+    threshold_upper: 1.0     # 阈值法：上阈值（σ 倍数）
+    threshold_lower: -1.0    # 阈值法：下阈值（σ 倍数）
+    ma_window: 20            # 均线法：均线窗口（交易日）
+    pct_lower: 0.20          # 极值法：多头触发下分位数
+    pct_upper: 0.80          # 极值法：空头触发上分位数
+    pct_window: null         # 极值法：滚动窗口（null=全样本，建议实盘设置）
+    ma_short: 20             # 长短均线差值法：短均线窗口（交易日）
+    ma_long: 60              # 长短均线差值法：长均线窗口（交易日）
 
 # ── 回测参数 ─────────────────────────────────────────────────────
 backtest:
@@ -46,7 +55,7 @@ backtest:
 
 # ── 输出配置 ──────────────────────────────────────────────────────
 output:
-  workspace_dir: "workspace/SP"              # 工作目录（相对 main.py 位置）
+  workspace_dir: "workspace/M_show1"              # 工作目录（相对 main.py 位置）
   eval_plots_subdir: "plots/eval"         # 因子评估图保存子目录
   backtest_plots_subdir: "plots/backtest" # 回测图保存子目录
   excel_filename: "timing_report.xlsx"    # Excel 报告文件名

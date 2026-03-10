@@ -62,9 +62,11 @@ class InSampleOutSampleResult:
     outsample_icir : float
         测试期 ICIR。
     insample_win_rate : float
-        训练期阈值信号胜率。
+        训练期最佳方法信号胜率。
     outsample_win_rate : float
-        测试期阈值信号胜率。
+        测试期最佳方法信号胜率（与样本内使用同一方法）。
+    best_signal_method : str
+        由样本内评分选出的最佳信号方法名称。
     ic_degradation : float
         IC 衰减比率 = (IC_in - IC_out) / |IC_in|。
         负值表示样本外优于样本内。
@@ -79,6 +81,7 @@ class InSampleOutSampleResult:
     outsample_icir: float
     insample_win_rate: float
     outsample_win_rate: float
+    best_signal_method: str
     ic_degradation: float
     is_robust: bool
 
@@ -92,6 +95,7 @@ class InSampleOutSampleResult:
             f"│  IC (样本外)    : {self.outsample_ic:>+8.4f}   "
             f"ICIR: {self.outsample_icir:>+7.4f}",
             f"│  IC 衰减幅度    : {deg_sign}{self.ic_degradation:.2%}",
+            f"│  胜率方法       : {self.best_signal_method}",
             f"│  胜率 (样本内)  : {self.insample_win_rate:>7.2%}",
             f"│  胜率 (样本外)  : {self.outsample_win_rate:>7.2%}",
             f"│  稳健性         : {'✓ 稳健' if self.is_robust else '✗ 不稳健':>5}",
@@ -164,12 +168,27 @@ class RobustnessTester:
         oos_returns = returns[split_date:]
 
         # 分别计算 IC
-        is_ic_res = self._ic_tester.run_test(is_factor, is_returns, self.forward_period)
+        is_ic_res  = self._ic_tester.run_test(is_factor,  is_returns,  self.forward_period)
         oos_ic_res = self._ic_tester.run_test(oos_factor, oos_returns, self.forward_period)
 
-        # 分别计算阈值信号胜率
-        is_sig = self._sig_tester.run_threshold_test(is_factor, is_returns)[0]
-        oos_sig = self._sig_tester.run_threshold_test(oos_factor, oos_returns)[0]
+        # 在样本内数据上运行所有信号方法，选出评分最高的方法
+        # （与 TimingFactorEvaluator.score() 保持一致的评分公式）
+        is_sig_all  = self._sig_tester.run_all(is_factor,  is_returns)
+        oos_sig_all = self._sig_tester.run_all(oos_factor, oos_returns)
+
+        method_scores: dict = {}
+        for method, result in is_sig_all.items():
+            res = result.full
+            wr_score  = min(1.0, max(0.0, (res.overall_win_rate - 0.50) / 0.20))
+            sig_bonus = 0.40 if res.is_significant else 0.2
+            method_scores[method] = min(1.0, wr_score + sig_bonus)
+
+        best_method = max(method_scores, key=method_scores.get)
+
+        # 用样本内最佳方法的结果作为样本内胜率，
+        # 并对样本外数据应用同一方法（避免前瞻偏差）
+        is_sig  = is_sig_all[best_method].full
+        oos_sig = oos_sig_all[best_method].full
 
         ic_in = is_ic_res.ic_mean
         ic_out = oos_ic_res.ic_mean
@@ -189,6 +208,7 @@ class RobustnessTester:
             outsample_icir=oos_ic_res.icir if not np.isnan(oos_ic_res.icir) else 0.0,
             insample_win_rate=is_sig.overall_win_rate,
             outsample_win_rate=oos_sig.overall_win_rate,
+            best_signal_method=best_method,
             ic_degradation=ic_deg,
             is_robust=is_robust,
         )

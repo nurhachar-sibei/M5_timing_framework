@@ -153,7 +153,7 @@ def generate_threshold_signals(
 
     因子超过上阈值时市场偏强 → 多头（+1）；
     因子低于下阈值时市场偏弱 → 空头（-1）；
-    介于两者之间 → 空仓（0）。
+    介于两者之间 → 沿袭上一日。
 
     对于标准化因子（均值≈0，标准差≈1），推荐 upper=1.0、lower=-1.0，
     可覆盖约 16% 的极端值区域。
@@ -172,9 +172,12 @@ def generate_threshold_signals(
     pd.Series
         整数信号序列：+1、0 或 -1。
     """
-    signals = pd.Series(0, index=factor.index, dtype=int)
-    signals[factor > upper] = 1
-    signals[factor < lower] = -1
+    sigma_ = factor.std()
+    mean_ = factor.mean()
+    signals = pd.Series(np.nan, index=factor.index, dtype=int)
+    signals[factor > upper * sigma_ + mean_] = 1
+    signals[factor < lower * sigma_ + mean_] = -1
+    signals.fillna(method="ffill", inplace=True)
     return signals
 
 
@@ -262,8 +265,9 @@ def generate_zero_signals(factor: pd.Series) -> pd.Series:
     """
     零值法信号生成。
 
-    因子值小于等于 0 时 → 空仓（0）；
-    因子值大于 0 时 → 多头（+1）。
+    因子值小于 均值（标准化下为0） 时 → 空仓、空头（-1）；
+    因子值大于 均值（标准化下为0） 时 → 多头（+1）。
+    因子值等于 均值（标准化下为0） 时 → 沿袭上一日。
 
     参数
     ----
@@ -273,10 +277,13 @@ def generate_zero_signals(factor: pd.Series) -> pd.Series:
     返回
     ----
     pd.Series
-        整数信号序列：+1、0 。
+        整数信号序列：+1、0、-1 。
     """
+    mean_ = factor.mean()
     signals = pd.Series(-1, index=factor.index, dtype=int)
-    signals[factor > 0] = 1
+    signals[factor > mean_] = 1
+    signals[factor == mean_] = np.nan
+    signals.fillna(method='ffill', inplace=True)
     return signals
 
 
@@ -285,7 +292,7 @@ def generate_diff_zero_signals(factor: pd.Series) -> pd.Series:
     """
     零值法（因子差）信号生成。
 
-    因子值小于等于 0 时 → 空仓（0）；
+    因子值小于等于 0 时 → 空仓（-1）；
     因子值大于 0 时 → 多头（+1）。
 
     参数
@@ -304,10 +311,35 @@ def generate_diff_zero_signals(factor: pd.Series) -> pd.Series:
     return signals
 
 
+def generate_ma_diff_zero_signals(
+    factor: pd.Series,
+    short_window: int = 20,
+    long_window: int = 60,
+) -> pd.Series:
+    """
+    长短均线差值法信号生成。
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 信号评估函数
-# ══════════════════════════════════════════════════════════════════════════════
+    计算因子自身的短期均线与长期均线之差，再将差值送入零值法：
+        差值 > 差值序列均值 → 多头（+1）；
+        差值 < 差值序列均值 → 空头（-1）。
+
+    参数
+    ----
+    factor       : pd.Series  因子序列。
+    short_window : int        短均线窗口（交易日）。
+    long_window  : int        长均线窗口（交易日），须 > short_window。
+
+    返回
+    ----
+    pd.Series  整数信号序列：+1 或 -1。
+    """
+    short_ma = factor.rolling(short_window, min_periods=short_window // 2).mean()
+    long_ma  = factor.rolling(long_window,  min_periods=long_window  // 2).mean()
+    diff     = short_ma - long_ma
+    return generate_zero_signals(diff)
+
+
+
 
 
 def _side_metrics(
@@ -435,6 +467,32 @@ def evaluate_signals(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 信号方法完整结果容器（含IS/OOS）
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class SignalMethodResult:
+    """
+    单种信号检验方法的完整结果（含全样本、样本内和样本外三段）。
+
+    属性
+    ----
+    full       : SignalTestResult  全样本检验结果
+    signal     : pd.Series         全样本信号序列（+1/0/-1）
+    insample   : SignalTestResult  样本内检验结果（可选）
+    outsample  : SignalTestResult  样本外检验结果（可选）
+    split_date : pd.Timestamp      IS/OOS 分割日期（可选）
+    """
+
+    full: SignalTestResult
+    signal: pd.Series
+    insample: Optional[SignalTestResult] = None
+    outsample: Optional[SignalTestResult] = None
+    split_date: Optional["pd.Timestamp"] = None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 高层封装类
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -510,6 +568,17 @@ class SignalTester:
         signals = generate_diff_zero_signals(factor)
         return [evaluate_signals(signals, fwd),signals]
 
+    def run_ma_diff_zero_test(
+        self,
+        factor: pd.Series,
+        returns: pd.Series,
+        short_window: int = 20,
+        long_window: int = 60,
+    ) -> SignalTestResult:
+        """长短均线差值法信号检验（差值送入零值法）。"""
+        fwd = returns.shift(-self.forward_period)
+        signals = generate_ma_diff_zero_signals(factor, short_window, long_window)
+        return [evaluate_signals(signals, fwd), signals]
 
 
     def run_all(
@@ -522,24 +591,129 @@ class SignalTester:
         pct_lower: float = 0.20,
         pct_upper: float = 0.80,
         pct_window: Optional[int] = None,
-    ) -> Dict[str, SignalTestResult]:
+        test_ratio: float = 0.30,
+        ma_short: int = 20,
+        ma_long: int = 60,
+    ) -> Dict[str, SignalMethodResult]:
         """
-        同时运行三种信号检验方法，返回结果字典。
+        同时运行所有信号检验方法，返回 SignalMethodResult 字典。
+
+        每种方法均包含全样本、样本内（IS）和样本外（OOS）三段评估结果。
+        IS/OOS 切分点由 test_ratio 控制（最后 test_ratio 比例为样本外）。
 
         返回
         ----
         dict
-            键：'threshold'（阈值法）、'moving_average'（均线法）、'percentile'（极值法）、'zero'（零值法）。
+            键：'threshold'、'moving_average'、'percentile'、'zero'、
+            'diff_zero'、'MA250_diff_zero'；
+            值：SignalMethodResult（含 .full / .signal / .insample / .outsample / .split_date）。
         """
-        return {
-            "threshold": self.run_threshold_test(
-                factor, returns, threshold_upper, threshold_lower
-            ),
-            "moving_average": self.run_ma_test(factor, returns, ma_window),
-            "percentile": self.run_percentile_test(
-                factor, returns, pct_lower, pct_upper, pct_window
-            ),
-            "zero": self.run_zero_test(factor, returns),
-            "diff_zero": self.run_diff_zero_test(factor, returns),
-            'MA250_diff_zero': self.run_diff_zero_test(factor.rolling(250).mean(), returns),
-        }
+        # ── 确定 IS/OOS 切分点 ─────────────────────────────────────────
+        valid = factor.dropna()
+        n = len(valid)
+        split_date = None
+        is_factor = oos_factor = is_returns = oos_returns = None
+
+        if n >= 10 and 0.0 < test_ratio < 1.0:
+            split_idx = int(n * (1.0 - test_ratio))
+            if 0 < split_idx < n:
+                split_date  = valid.index[split_idx]
+                is_factor   = factor[:split_date]
+                oos_factor  = factor[split_date:]
+                is_returns  = returns[:split_date]
+                oos_returns = returns[split_date:]
+
+        # ── 内部辅助：对子集安全地运行某种方法 ────────────────────────
+        def _try_is_oos(run_fn_is, run_fn_oos):
+            """返回 (is_result, oos_result)，任一失败则返回 None。"""
+            if split_date is None:
+                return None, None
+            try:
+                is_r  = run_fn_is()[0]
+                oos_r = run_fn_oos()[0]
+                return is_r, oos_r
+            except Exception:
+                return None, None
+
+        # ── 逐方法计算 ──────────────────────────────────────────────────
+        results: Dict[str, SignalMethodResult] = {}
+
+        # 阈值法
+        full_thr = self.run_threshold_test(factor, returns, threshold_upper, threshold_lower)
+        is_thr, oos_thr = _try_is_oos(
+            lambda: self.run_threshold_test(is_factor, is_returns, threshold_upper, threshold_lower),
+            lambda: self.run_threshold_test(oos_factor, oos_returns, threshold_upper, threshold_lower),
+        )
+        results["threshold"] = SignalMethodResult(
+            full=full_thr[0], signal=full_thr[1],
+            insample=is_thr, outsample=oos_thr, split_date=split_date,
+        )
+
+        # 均线法
+        full_ma = self.run_ma_test(factor, returns, ma_window)
+        is_ma, oos_ma = _try_is_oos(
+            lambda: self.run_ma_test(is_factor, is_returns, ma_window),
+            lambda: self.run_ma_test(oos_factor, oos_returns, ma_window),
+        )
+        results["moving_average"] = SignalMethodResult(
+            full=full_ma[0], signal=full_ma[1],
+            insample=is_ma, outsample=oos_ma, split_date=split_date,
+        )
+
+        # 极值法
+        full_pct = self.run_percentile_test(factor, returns, pct_lower, pct_upper, pct_window)
+        is_pct, oos_pct = _try_is_oos(
+            lambda: self.run_percentile_test(is_factor, is_returns, pct_lower, pct_upper, pct_window),
+            lambda: self.run_percentile_test(oos_factor, oos_returns, pct_lower, pct_upper, pct_window),
+        )
+        results["percentile"] = SignalMethodResult(
+            full=full_pct[0], signal=full_pct[1],
+            insample=is_pct, outsample=oos_pct, split_date=split_date,
+        )
+
+        # 零值法
+        full_z = self.run_zero_test(factor, returns)
+        is_z, oos_z = _try_is_oos(
+            lambda: self.run_zero_test(is_factor, is_returns),
+            lambda: self.run_zero_test(oos_factor, oos_returns),
+        )
+        results["zero"] = SignalMethodResult(
+            full=full_z[0], signal=full_z[1],
+            insample=is_z, outsample=oos_z, split_date=split_date,
+        )
+
+        # 差分零值法
+        full_dz = self.run_diff_zero_test(factor, returns)
+        is_dz, oos_dz = _try_is_oos(
+            lambda: self.run_diff_zero_test(is_factor, is_returns),
+            lambda: self.run_diff_zero_test(oos_factor, oos_returns),
+        )
+        results["diff_zero"] = SignalMethodResult(
+            full=full_dz[0], signal=full_dz[1],
+            insample=is_dz, outsample=oos_dz, split_date=split_date,
+        )
+
+        # 250日移动平均差分零值法
+        full_ma250 = self.run_diff_zero_test(factor.rolling(250).mean(), returns)
+        is_ma250, oos_ma250 = _try_is_oos(
+            lambda: self.run_diff_zero_test(is_factor.rolling(250).mean(), is_returns),
+            lambda: self.run_diff_zero_test(oos_factor.rolling(250).mean(), oos_returns),
+        )
+        results["MA250_diff_zero"] = SignalMethodResult(
+            full=full_ma250[0], signal=full_ma250[1],
+            insample=is_ma250, outsample=oos_ma250, split_date=split_date,
+        )
+
+        # 长短均线差值法
+        full_mad = self.run_ma_diff_zero_test(factor, returns, ma_short, ma_long)
+        is_mad, oos_mad = _try_is_oos(
+            lambda: self.run_ma_diff_zero_test(is_factor, is_returns, ma_short, ma_long),
+            lambda: self.run_ma_diff_zero_test(oos_factor, oos_returns, ma_short, ma_long),
+        )
+        results["ma_diff_zero"] = SignalMethodResult(
+            full=full_mad[0], signal=full_mad[1],
+            insample=is_mad, outsample=oos_mad, split_date=split_date,
+        )
+
+        return results
+
