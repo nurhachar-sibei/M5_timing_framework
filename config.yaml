@@ -4,22 +4,23 @@
 
 # ── 资产配置 ────────────────────────────────────────────────────
 asset:
-  name: "M"            # 资产显示名称（用于报告标题）
-  code: "M.DCE"          # 资产代码（用于匹配 price_df.csv 中的列）
+  name: "OIL"            # 资产显示名称（用于报告标题）
+  code: "OIL"          # 资产代码（用于匹配 price_df.csv 中的列）
   price_field: "CLOSE"       # 价格字段名称
 
 # ── 数据文件配置 ────────────────────────────────────────────────
 data:
-  price_file: "price_m.csv"   # data_ini/ 中的价格文件名
-  signal_file: "inifactor_m.csv"    # data_ini/ 中的信号文件名
-  start_date: "2015-06-17"               # 信号测试起始日期，格式 YYYY-MM-DD，空字符串=不限制
+  price_file: "price_oil.csv"   # data_ini/ 中的价格文件名
+  signal_file: "inifactor_o.csv"    # data_ini/ 中的信号文件名
+  start_date: "2012-01-01"               # 信号测试起始日期，格式 YYYY-MM-DD，空字符串=不限制
   end_date: "2026-01-01"                 # 信号测试结束日期，格式 YYYY-MM-DD，空字符串=不限制
 
 # ── 信号配置 ────────────────────────────────────────────────────
 signals:
   use_all: false        # true=使用信号文件所有列，false=使用 selected 列表
   selected:                  # use_all=false 时生效，填写需分析的信号列名
-    - "m_store"
+    - "storage_oil"
+    - "MA_55"
 
 # ── 因子评估参数 ─────────────────────────────────────────────────
 evaluation:
@@ -55,7 +56,7 @@ backtest:
 
 # ── 输出配置 ──────────────────────────────────────────────────────
 output:
-  workspace_dir: "workspace/M_show1"              # 工作目录（相对 main.py 位置）
+  workspace_dir: "workspace/OIL_show1"              # 工作目录（相对 main.py 位置）
   eval_plots_subdir: "plots/eval"         # 因子评估图保存子目录
   backtest_plots_subdir: "plots/backtest" # 回测图保存子目录
   excel_filename: "timing_report.xlsx"    # Excel 报告文件名
