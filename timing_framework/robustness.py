@@ -161,34 +161,49 @@ class RobustnessTester:
         split_idx = int(n * (1.0 - test_ratio))
         split_date = valid.index[split_idx]
 
-        # 时间序列分割（前 70% 样本内，后 30% 样本外）
-        is_factor = factor[:split_date]
+        # 时间序列分割（仅用于 IC 计算）
+        is_factor  = factor[:split_date]
         oos_factor = factor[split_date:]
-        is_returns = returns[:split_date]
+        is_returns  = returns[:split_date]
         oos_returns = returns[split_date:]
 
-        # 分别计算 IC
+        # 分别计算 IC（IC 无滚动窗口暖机问题，可在子集上独立计算）
         is_ic_res  = self._ic_tester.run_test(is_factor,  is_returns,  self.forward_period)
         oos_ic_res = self._ic_tester.run_test(oos_factor, oos_returns, self.forward_period)
 
-        # 在样本内数据上运行所有信号方法，选出评分最高的方法
-        # （与 TimingFactorEvaluator.score() 保持一致的评分公式）
-        is_sig_all  = self._sig_tester.run_all(is_factor,  is_returns)
-        oos_sig_all = self._sig_tester.run_all(oos_factor, oos_returns)
+        # 在完整数据上运行所有信号方法，内部自动完成 IS/OOS 切割
+        # （信号在全序列上生成，避免 OOS 段开头丢失滚动窗口暖机数据）
+        sig_all = self._sig_tester.run_all(factor, returns, test_ratio=test_ratio)
+
+        # 用与 TimingFactorEvaluator.score() 完全一致的四维度公式
+        # 在样本内结果上评分，选出最佳方法
+        def _p_score(p: float) -> float:
+            return max(0.0, 1.0 - p / 0.20)
+
+        def _method_score(res) -> float:
+            A = min(1.0, max(0.0, (res.overall_win_rate - 0.50) / 0.20))
+            long_s  = min(1.0, max(0.0,  res.long_avg_return  / 0.002))
+            short_s = min(1.0, max(0.0, -res.short_avg_return / 0.002))
+            B = 0.5 * long_s + 0.5 * short_s
+            C = (0.30 * _p_score(res.long_t_pval)
+                 + 0.30 * _p_score(res.short_t_pval)
+                 + 0.40 * _p_score(res.p_value))
+            pl = res.overall_pl_ratio
+            pl = 1.0 if pl>1 else pl
+            D = pl
+            return 0.25 * A + 0.25 * B + 0.30 * C + 0.20 * D
 
         method_scores: dict = {}
-        for method, result in is_sig_all.items():
-            res = result.full
-            wr_score  = min(1.0, max(0.0, (res.overall_win_rate - 0.50) / 0.20))
-            sig_bonus = 0.40 if res.is_significant else 0.2
-            method_scores[method] = min(1.0, wr_score + sig_bonus)
+        for method, smr in sig_all.items():
+            # 用样本内结果评分；若无 insample，退而使用全样本结果
+            res = smr.insample if smr.insample is not None else smr.full
+            method_scores[method] = _method_score(res)
 
         best_method = max(method_scores, key=method_scores.get)
 
-        # 用样本内最佳方法的结果作为样本内胜率，
-        # 并对样本外数据应用同一方法（避免前瞻偏差）
-        is_sig  = is_sig_all[best_method].full
-        oos_sig = oos_sig_all[best_method].full
+        # 取最佳方法的样本内/外结果
+        is_sig  = sig_all[best_method].insample or sig_all[best_method].full
+        oos_sig = sig_all[best_method].outsample or sig_all[best_method].full
 
         ic_in = is_ic_res.ic_mean
         ic_out = oos_ic_res.ic_mean

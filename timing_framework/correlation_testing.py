@@ -183,6 +183,7 @@ def calculate_rolling_ic(
     """
     fwd_returns = returns.shift(-forward_period)
     df = pd.DataFrame({"f": factor, "r": fwd_returns}).dropna()
+    df.to_csv(f'check_file/{forward_period}.csv')
     ic_values = pd.Series(index=factor.index, dtype=float)
     for i in range(rolling_window, len(df)-1):
         window_data = df.iloc[i - rolling_window : i].dropna()
@@ -195,6 +196,7 @@ def calculate_rolling_ic(
         else:
             ic, _ = stats.pearsonr(window_data["f"], window_data["r"])
         ic_values.iloc[i] = ic
+    ic_values.to_csv(f'check_file/rolling_ic_{forward_period}.csv')
     return ic_values
 
 

@@ -304,32 +304,43 @@ class TimingFactorEvaluator:
                 # 线性映射：|ICIR| 在 [0, 1.0] 区间映射到 [0, 1] 并截断
                 ic_score = min(1.0, abs(ic_res.icir))
 
-        # ── 信号评分：胜率 + 显著性加分 ────────────────────────────
+        # ── 信号评分：四维度加权 ─────────────────────────────────────
+        # A(25%) 胜率  B(25%) 收益幅度  C(30%) T检验显著性  D(20%) 盈亏比
+        def _p_score(p: float) -> float:
+            """p 值线性映射到 [0,1]：p=0→1.0，p=0.20→0.0"""
+            return max(0.0, 1.0 - p / 0.20)
+
+        def _method_signal_score(full) -> float:
+            # A：综合胜率，50%起算，70%满分
+            A = min(1.0, max(0.0, (full.overall_win_rate - 0.50) / 0.20))
+
+            # B：多空收益幅度，日均±0.2%各满分
+            long_s  = min(1.0, max(0.0,  full.long_avg_return  / 0.002))
+            short_s = min(1.0, max(0.0, -full.short_avg_return / 0.002))
+            B = 0.5 * long_s + 0.5 * short_s
+
+            # C：三项 T 检验显著性
+            C = (0.30 * _p_score(full.long_t_pval)
+                 + 0.30 * _p_score(full.short_t_pval)
+                 + 0.40 * _p_score(full.p_value))
+
+            # D：策略整体盈亏比，inf 视为满分；1.0→0，3.0→满分
+            pl = full.overall_pl_ratio
+            pl = 1.0 if pl>=1 else pl
+
+            D = pl
+
+            return min(0.25 * A + 0.25 * B + 0.30 * C + 0.20 * D,1)
+
         signal_score = 0.0
         if self._signal_results:
-            # # key_in_signal_results = self.
-            # thr = self._signal_results.get("threshold")
-            # if thr:
-            #     # 胜率在 [0.50, 0.70] 区间线性映射到 [0, 1]
-            #     wr_score = min(1.0, max(0.0, (thr.overall_win_rate - 0.50) / 0.20))
-            #     sig_bonus = 0.20 if thr.is_significant else 0.0
-            #     signal_score = min(1.0, wr_score + sig_bonus)
-
-            key_in_signal_results = self._signal_results.keys()
-            signal_score_dict = {}
-            for key in key_in_signal_results:
-                sig_ = self._signal_results.get(key)
-                if sig_:
-                    # 胜率在 [0.50, 0.70] 区间线性映射到 [0, 1]
-                    wr_score = min(1.0, max(0.0, (sig_.full.overall_win_rate - 0.50) / 0.20))
-                    sig_bonus = 0.40 if sig_.full.is_significant else 0.2
-                    signal_score_dict[key] = min(1.0, wr_score + sig_bonus)
-
+            signal_score_dict = {
+                key: _method_signal_score(res.full)
+                for key, res in self._signal_results.items()
+            }
             signal_score = max(signal_score_dict.values())
             self.best_method = max(signal_score_dict, key=signal_score_dict.get)
-            self.best_signal = self._signal_results.get(self.best_method).signal
-            # print(f"信号评分：{signal_score}，最佳方法：{self.best_method}")
-            # print(f"最佳信号：{self.best_signal}")
+            self.best_signal = self._signal_results[self.best_method].signal
 
 
 
@@ -390,30 +401,19 @@ class TimingFactorEvaluator:
 
         # 信号检验
         print("── 1. 信号检验法 ───────────────────────────────────────────")
+        label_map = {
+            "threshold": "阈值法",
+            "moving_average": "均线法",
+            "percentile": "极值法",
+            "zero": "零值法",
+            "diff_zero": "差分零值法",
+            "MA250_diff_zero": "250日移动平均差分零值法",
+            "ma_diff_zero": "长短均线差值法",
+        }
         for method_name, result in (self._signal_results or {}).items():
-            label_map = {
-                "threshold": "阈值法",
-                "moving_average": "均线法",
-                "percentile": "极值法",
-                "zero": "零值法",
-                "diff_zero": "差分零值法",
-                "MA250_diff_zero": "250日移动平均差分零值法",
-                "ma_diff_zero": "长短均线差值法",
-            }
             label = label_map.get(method_name, method_name.upper())
-            print(f"\n  [{label}]")
-            print(result.full.summary())
-            # IS/OOS 小结
-            if result.insample is not None and result.outsample is not None:
-                sd = str(result.split_date)[:10] if result.split_date else "N/A"
-                print(
-                    f"    ├ IS  (截至{sd}): 多头胜率={result.insample.long_win_rate:.2%}"
-                    f"  盈亏比={result.insample.long_pl_ratio:.2f}"
-                )
-                print(
-                    f"    └ OOS (之后    ): 多头胜率={result.outsample.long_win_rate:.2%}"
-                    f"  盈亏比={result.outsample.long_pl_ratio:.2f}"
-                )
+            print()
+            print(result.summary(method_label=label))
 
         # IC 检验
         print("\n── 2. 相关性检验法（IC / ICIR）─────────────────────────────")

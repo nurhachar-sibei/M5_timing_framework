@@ -60,25 +60,31 @@ class SignalTestResult:
 
     属性
     ----
-    n_long : int               多头信号次数
+    n_long : int               多头信号持仓天数
     long_win_rate : float      多头胜率  P(return > 0 | 多头信号)
     long_avg_return : float    多头期间平均收益率（期望 > 0）
     long_avg_profit : float    多头盈利交易的平均收益
     long_avg_loss : float      多头亏损交易的平均亏损
     long_pl_ratio : float      多头盈亏比 |avg_profit / avg_loss|
-    n_short : int              空头信号次数
+    long_t_stat : float        多头收益率单样本 t 检验统计量（H0: μ=0）
+    long_t_pval : float        多头收益率单样本 t 检验 p 值
+    n_short : int              空头信号持仓天数
     short_win_rate : float     空头胜率  P(return < 0 | 空头信号)
     short_avg_return : float   空头期间平均收益率（期望 < 0）
     short_avg_profit : float   空头盈利交易的平均收益
     short_avg_loss : float     空头亏损交易的平均亏损
     short_pl_ratio : float     空头盈亏比
-    overall_win_rate : float   综合胜率 = (正确多头 + 正确空头) / 总信号数
+    short_t_stat : float       空头收益率单样本 t 检验统计量（H0: μ=0）
+    short_t_pval : float       空头收益率单样本 t 检验 p 值
+    overall_win_rate : float   综合胜率 = (正确多头 + 正确空头) / 总持仓天数
     long_short_return_spread : float  多头均收益 − 空头均收益（期望 > 0）
-    t_statistic : float        Welch t 检验统计量（多头 vs 空头收益率）
+    overall_pl_ratio : float   策略整体盈亏比（多空合并后 avg_profit / |avg_loss|）
+    t_statistic : float        Welch t 检验统计量（多头 vs 空头收益率双样本）
     p_value : float            双侧 p 值
     is_significant : bool      p < 0.05 则为显著
     long_coverage : float      多头信号占全部交易日的比例
     short_coverage : float     空头信号占全部交易日的比例
+    n_total_days : int         策略进行总天数（多头 + 空头持仓天数之和）
     """
 
     # --- 多头信号指标 ---
@@ -88,6 +94,8 @@ class SignalTestResult:
     long_avg_profit: float
     long_avg_loss: float
     long_pl_ratio: float
+    long_t_stat: float
+    long_t_pval: float
 
     # --- 空头信号指标 ---
     n_short: int
@@ -96,12 +104,15 @@ class SignalTestResult:
     short_avg_profit: float
     short_avg_loss: float
     short_pl_ratio: float
+    short_t_stat: float
+    short_t_pval: float
 
     # --- 综合指标 ---
     overall_win_rate: float
     long_short_return_spread: float
+    overall_pl_ratio: float
 
-    # --- 统计显著性 ---
+    # --- 多空双样本 T 检验 ---
     t_statistic: float
     p_value: float
     is_significant: bool
@@ -110,23 +121,58 @@ class SignalTestResult:
     long_coverage: float
     short_coverage: float
 
+    # --- 总天数 ---
+    n_total_days: int
+
+    # --- 策略表现 ---
+    sharpe_ratio: float
+    max_drawdown: float   # 负值，如 -0.15 表示最大回撤 15%
+
+    # --- 内部存储（供 IS/OOS 跨期 T 检验使用，不在 summary 中展示）---
+    long_rets: Optional[pd.Series] = None
+
     def summary(self) -> str:
+        def _sig(pval: float) -> str:
+            if pval < 0.01:
+                return "***"
+            elif pval < 0.05:
+                return "** "
+            elif pval < 0.10:
+                return "*  "
+            else:
+                return "   "
+
+        mdd_str = f"{self.max_drawdown:>+9.2%}" if self.max_drawdown != 0.0 else "      N/A"
+        pl_str = f"{self.overall_pl_ratio:>8.3f}" if not np.isinf(self.overall_pl_ratio) else "       ∞"
+
         lines = [
-            "┌─── 信号检验结果 ──────────────────────────────────────────┐",
-            f"│ 多头信号数 : {self.n_long:>5}  ({self.long_coverage:>5.1%} 的时间)",
-            f"│   胜   率  : {self.long_win_rate:>7.2%}",
-            f"│   均收益率 : {self.long_avg_return:>+9.4f}",
-            f"│   盈亏比   : {self.long_pl_ratio:>7.2f}",
-            f"│ 空头信号数 : {self.n_short:>5}  ({self.short_coverage:>5.1%} 的时间)",
-            f"│   胜   率  : {self.short_win_rate:>7.2%}",
-            f"│   均收益率 : {self.short_avg_return:>+9.4f}",
-            f"│   盈亏比   : {self.short_pl_ratio:>7.2f}",
-            f"│ 综合胜率        : {self.overall_win_rate:>6.2%}",
-            f"│ 多空收益差      : {self.long_short_return_spread:>+9.4f}",
-            f"│ T 统计量        : {self.t_statistic:>+8.4f}",
-            f"│ P 值            : {self.p_value:>8.4f}",
-            f"│ 显著性 (α=5%)   : {'✓ 显著' if self.is_significant else '✗ 不显著':>5}",
-            "└────────────────────────────────────────────────────────────┘",
+            "┌─── 信号检验结果 ─────────────────────────────────────────────────┐",
+            f"│  策略进行总天数   : {self.n_total_days:>6} 天"
+            f"  （多头 {self.n_long} 天 / 空头 {self.n_short} 天）",
+            "│",
+            "│  ── 方向指标 ──────────────────────────────────────────────────",
+            f"│  多头持仓天数     : {self.n_long:>6} 天  占比 {self.long_coverage:>5.1%}",
+            f"│  空头持仓天数     : {self.n_short:>6} 天  占比 {self.short_coverage:>5.1%}",
+            f"│  多头胜率         : {self.long_win_rate:>7.2%}",
+            f"│  空头胜率         : {self.short_win_rate:>7.2%}",
+            f"│  综合胜率         : {self.overall_win_rate:>7.2%}",
+            "│",
+            "│  ── 收益与风险 ─────────────────────────────────────────────────",
+            f"│  多头均收益率     : {self.long_avg_return:>+10.4%}",
+            f"│  空头均收益率     : {self.short_avg_return:>+10.4%}",
+            f"│  多空收益差       : {self.long_short_return_spread:>+10.4%}",
+            f"│  策略盈亏比       : {pl_str}",
+            f"│  年化夏普比率     : {self.sharpe_ratio:>+8.3f}",
+            f"│  最大回撤         : {mdd_str}",
+            "│",
+            "│  ── T 检验（显著性：*** p<0.01  ** p<0.05  * p<0.10）─────────",
+            f"│  多头收益率T检验  : t={self.long_t_stat:>+8.4f}  p={self.long_t_pval:>7.4f} {_sig(self.long_t_pval)}"
+            "  (H₀: μ_多头=0)",
+            f"│  空头收益率T检验  : t={self.short_t_stat:>+8.4f}  p={self.short_t_pval:>7.4f} {_sig(self.short_t_pval)}"
+            "  (H₀: μ_空头=0)",
+            f"│  多空收益T检验    : t={self.t_statistic:>+8.4f}  p={self.p_value:>7.4f} {_sig(self.p_value)}"
+            "  (H₀: μ_多头=μ_空头, Welch双样本)",
+            "└──────────────────────────────────────────────────────────────────┘",
         ]
         return "\n".join(lines)
 
@@ -412,9 +458,8 @@ def evaluate_signals(
     """
     # 对齐并过滤空仓期
     df = pd.DataFrame({"signal": signals, "ret": forward_returns}).dropna()
+    n_valid_periods = len(df)   # dropna 后有效行数，作为覆盖率分母
     df = df[df["signal"] != 0]
-
-    n_total_periods = len(signals)
     long_df = df[df["signal"] == 1]
     short_df = df[df["signal"] == -1]
 
@@ -433,15 +478,54 @@ def evaluate_signals(
     total_signals = n_long + n_short
     overall_wr = (correct_longs + correct_shorts) / total_signals if total_signals > 0 else 0.0
 
-    # Welch t 检验：H0: 多头均收益 == 空头均收益
+    # 单样本 t 检验：H0: 多头均收益 == 0
+    if n_long > 1:
+        l_t_stat, l_t_pval = stats.ttest_1samp(long_rets, popmean=0.0)
+    else:
+        l_t_stat, l_t_pval = 0.0, 1.0
+
+    # 单样本 t 检验：H0: 空头均收益 == 0
+    if n_short > 1:
+        s_t_stat, s_t_pval = stats.ttest_1samp(short_rets, popmean=0.0)
+    else:
+        s_t_stat, s_t_pval = 0.0, 1.0
+
+    # Welch 双样本 t 检验：H0: 多头均收益 == 空头均收益
     if n_long > 1 and n_short > 1:
         t_stat, p_val = stats.ttest_ind(long_rets, short_rets, equal_var=False)
     else:
         t_stat, p_val = 0.0, 1.0
 
-    # 信号覆盖率
-    long_cov = n_long / n_total_periods if n_total_periods > 0 else 0.0
-    short_cov = n_short / n_total_periods if n_total_periods > 0 else 0.0
+    # 策略整体盈亏比：多空合并后的策略收益（做空时收益取反）
+    # 注意：需按时间顺序保留，此处仅用于盈亏比计算，故合并无序
+    strategy_rets_all = df["signal"] * df["ret"]  # 按原始时间顺序的策略收益
+    strat_profits = strategy_rets_all[strategy_rets_all > 0]
+    strat_losses = strategy_rets_all[strategy_rets_all <= 0]
+    if len(strat_profits) > 0 and len(strat_losses) > 0 and strat_losses.mean() != 0:
+        overall_pl = abs(strat_profits.mean() / strat_losses.mean())
+    elif len(strat_losses) == 0:
+        overall_pl = float("inf")
+    else:
+        overall_pl = 0.0
+
+    # 年化夏普比率（基于持仓期日度策略收益，×√252 年化）
+    if len(strategy_rets_all) > 1 and strategy_rets_all.std() > 0:
+        sharpe = strategy_rets_all.mean() / strategy_rets_all.std() * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # 最大回撤（基于策略累计净值曲线，负值）
+    if len(strategy_rets_all) > 0:
+        cum = (1 + strategy_rets_all).cumprod()
+        rolling_max = cum.cummax()
+        drawdowns = (cum - rolling_max) / rolling_max
+        max_dd = float(drawdowns.min())
+    else:
+        max_dd = 0.0
+
+    # 信号覆盖率（分母用 dropna 后有效行数，排除预处理 NaN 暖机期）
+    long_cov = n_long / n_valid_periods if n_valid_periods > 0 else 0.0
+    short_cov = n_short / n_valid_periods if n_valid_periods > 0 else 0.0
 
     return SignalTestResult(
         n_long=n_long,
@@ -450,19 +534,28 @@ def evaluate_signals(
         long_avg_profit=l_profit,
         long_avg_loss=l_loss,
         long_pl_ratio=l_pl,
+        long_t_stat=float(l_t_stat),
+        long_t_pval=float(l_t_pval),
         n_short=n_short,
         short_win_rate=s_wr,
         short_avg_return=s_avg,
         short_avg_profit=s_profit,
         short_avg_loss=s_loss,
         short_pl_ratio=s_pl,
+        short_t_stat=float(s_t_stat),
+        short_t_pval=float(s_t_pval),
         overall_win_rate=overall_wr,
         long_short_return_spread=l_avg - s_avg,
+        overall_pl_ratio=overall_pl,
         t_statistic=float(t_stat),
         p_value=float(p_val),
         is_significant=(float(p_val) < 0.05),
         long_coverage=long_cov,
         short_coverage=short_cov,
+        n_total_days=total_signals,
+        sharpe_ratio=float(sharpe),
+        max_drawdown=float(max_dd),
+        long_rets=long_rets.reset_index(drop=True),
     )
 
 
@@ -490,6 +583,63 @@ class SignalMethodResult:
     insample: Optional[SignalTestResult] = None
     outsample: Optional[SignalTestResult] = None
     split_date: Optional["pd.Timestamp"] = None
+    # IS vs OOS 多头收益跨期 T 检验结果（由 run_all 填充）
+    is_oos_long_t_stat: float = 0.0
+    is_oos_long_t_pval: float = 1.0
+
+    def summary(self, method_label: str = "") -> str:
+        """
+        输出该方法的完整检验报告，包含全样本结果以及样本内/样本外对比。
+
+        参数
+        ----
+        method_label : str
+            方法名称标签，用于标题显示。
+        """
+        title = f"  [{method_label}]" if method_label else "  [信号检验]"
+        lines = [title, self.full.summary()]
+
+        if self.insample is not None and self.outsample is not None:
+            sd = str(self.split_date)[:10] if self.split_date else "N/A"
+            is_r = self.insample
+            oos_r = self.outsample
+
+            def _pl_str(v: float) -> str:
+                return f"{v:.3f}" if not np.isinf(v) else "∞"
+
+            def _sig3(p: float) -> str:
+                return "***" if p < 0.01 else ("** " if p < 0.05 else ("*  " if p < 0.10 else "   "))
+
+            # 多头收益 OOS 相对 IS 的变化方向
+            long_ret_chg = oos_r.long_avg_return - is_r.long_avg_return
+            long_ret_arrow = "↑" if long_ret_chg > 0 else "↓"
+            long_ret_tag = f"{long_ret_arrow} {abs(long_ret_chg):+.4%}"
+
+            # 夏普与最大回撤格式
+            def _mdd(v: float) -> str:
+                return f"{v:>+.2%}" if v != 0.0 else "  N/A"
+
+            lines += [
+                f"    ┌─── 样本内/外对比（分割日期：{sd}）──────────────────────────────┐",
+                f"    │                    {'样本内 (IS)':^22} {'样本外 (OOS)':^22}",
+                f"    │  持仓天数         {'多'+str(is_r.n_long)+'天/空'+str(is_r.n_short)+'天':^22} {'多'+str(oos_r.n_long)+'天/空'+str(oos_r.n_short)+'天':^22}",
+                f"    │  综合胜率         {is_r.overall_win_rate:>20.2%}   {oos_r.overall_win_rate:>20.2%}",
+                f"    │  多头胜率         {is_r.long_win_rate:>20.2%}   {oos_r.long_win_rate:>20.2%}",
+                f"    │  空头胜率         {is_r.short_win_rate:>20.2%}   {oos_r.short_win_rate:>20.2%}",
+                f"    │  多头均收益       {is_r.long_avg_return:>+20.4%}   {oos_r.long_avg_return:>+20.4%}", 
+                f"    │  策略盈亏比       {_pl_str(is_r.overall_pl_ratio):>22}   {_pl_str(oos_r.overall_pl_ratio):>22}",
+                f"    │  年化夏普         {is_r.sharpe_ratio:>+20.3f}   {oos_r.sharpe_ratio:>+20.3f}",
+                f"    │  最大回撤         {_mdd(is_r.max_drawdown):>22}   {_mdd(oos_r.max_drawdown):>22}",
+                f"    │",
+                f"    │  ── IS vs OOS 多头收益对比 ──────────────────────────────────",
+                f"    │  OOS 多头均收益相对 IS  : {long_ret_tag}",
+                f"    │  IS vs OOS 多头收益T检验: t={self.is_oos_long_t_stat:>+8.4f}  "
+                f"p={self.is_oos_long_t_pval:>7.4f} {_sig3(self.is_oos_long_t_pval)}"
+                f"  (H₀: μ_IS多头=μ_OOS多头)",
+                f"    └────────────────────────────────────────────────────────────────┘",
+            ]
+
+        return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -612,107 +762,117 @@ class SignalTester:
         valid = factor.dropna()
         n = len(valid)
         split_date = None
-        is_factor = oos_factor = is_returns = oos_returns = None
 
         if n >= 10 and 0.0 < test_ratio < 1.0:
             split_idx = int(n * (1.0 - test_ratio))
             if 0 < split_idx < n:
-                split_date  = valid.index[split_idx]
-                is_factor   = factor[:split_date]
-                oos_factor  = factor[split_date:]
-                is_returns  = returns[:split_date]
-                oos_returns = returns[split_date:]
+                split_date = valid.index[split_idx]
 
-        # ── 内部辅助：对子集安全地运行某种方法 ────────────────────────
-        def _try_is_oos(run_fn_is, run_fn_oos):
-            """返回 (is_result, oos_result)，任一失败则返回 None。"""
+        # 全序列 forward returns（信号评估用）
+        fwd_full = returns.shift(-self.forward_period)
+
+        # ── 内部辅助：在完整信号序列上切割 IS/OOS ─────────────────────
+        # 信号在完整因子序列上生成，避免 OOS 段开头丢失滚动窗口暖机数据
+        def _split_eval(signals_full: pd.Series):
+            """将完整信号按 split_date 切割，分别评估 IS 与 OOS。"""
             if split_date is None:
                 return None, None
             try:
-                is_r  = run_fn_is()[0]
-                oos_r = run_fn_oos()[0]
-                return is_r, oos_r
+                is_sig  = signals_full[:split_date]
+                oos_sig = signals_full[split_date:]
+                is_fwd  = fwd_full[:split_date]
+                oos_fwd = fwd_full[split_date:]
+                return evaluate_signals(is_sig, is_fwd), evaluate_signals(oos_sig, oos_fwd)
             except Exception:
                 return None, None
 
+        def _is_oos_long_ttest(
+            is_res: Optional[SignalTestResult],
+            oos_res: Optional[SignalTestResult],
+        ) -> Tuple[float, float]:
+            """Welch 双样本 T 检验：IS 多头收益 vs OOS 多头收益（H₀: 两者均值相等）。"""
+            if (
+                is_res is None or oos_res is None
+                or is_res.long_rets is None or oos_res.long_rets is None
+                or len(is_res.long_rets) < 2 or len(oos_res.long_rets) < 2
+            ):
+                return 0.0, 1.0
+            t, p = stats.ttest_ind(is_res.long_rets, oos_res.long_rets, equal_var=False)
+            return float(t), float(p)
+
         # ── 逐方法计算 ──────────────────────────────────────────────────
+        # 所有方法均在完整 factor 序列上生成信号，再切割信号做 IS/OOS 评估，
+        # 保证 OOS 段开头的滚动窗口能利用 IS 段数据完成暖机。
         results: Dict[str, SignalMethodResult] = {}
 
         # 阈值法
         full_thr = self.run_threshold_test(factor, returns, threshold_upper, threshold_lower)
-        is_thr, oos_thr = _try_is_oos(
-            lambda: self.run_threshold_test(is_factor, is_returns, threshold_upper, threshold_lower),
-            lambda: self.run_threshold_test(oos_factor, oos_returns, threshold_upper, threshold_lower),
-        )
+        is_thr, oos_thr = _split_eval(full_thr[1])
+        _t, _p = _is_oos_long_ttest(is_thr, oos_thr)
         results["threshold"] = SignalMethodResult(
             full=full_thr[0], signal=full_thr[1],
             insample=is_thr, outsample=oos_thr, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 均线法
         full_ma = self.run_ma_test(factor, returns, ma_window)
-        is_ma, oos_ma = _try_is_oos(
-            lambda: self.run_ma_test(is_factor, is_returns, ma_window),
-            lambda: self.run_ma_test(oos_factor, oos_returns, ma_window),
-        )
+        is_ma, oos_ma = _split_eval(full_ma[1])
+        _t, _p = _is_oos_long_ttest(is_ma, oos_ma)
         results["moving_average"] = SignalMethodResult(
             full=full_ma[0], signal=full_ma[1],
             insample=is_ma, outsample=oos_ma, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 极值法
         full_pct = self.run_percentile_test(factor, returns, pct_lower, pct_upper, pct_window)
-        is_pct, oos_pct = _try_is_oos(
-            lambda: self.run_percentile_test(is_factor, is_returns, pct_lower, pct_upper, pct_window),
-            lambda: self.run_percentile_test(oos_factor, oos_returns, pct_lower, pct_upper, pct_window),
-        )
+        is_pct, oos_pct = _split_eval(full_pct[1])
+        _t, _p = _is_oos_long_ttest(is_pct, oos_pct)
         results["percentile"] = SignalMethodResult(
             full=full_pct[0], signal=full_pct[1],
             insample=is_pct, outsample=oos_pct, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 零值法
         full_z = self.run_zero_test(factor, returns)
-        is_z, oos_z = _try_is_oos(
-            lambda: self.run_zero_test(is_factor, is_returns),
-            lambda: self.run_zero_test(oos_factor, oos_returns),
-        )
+        is_z, oos_z = _split_eval(full_z[1])
+        _t, _p = _is_oos_long_ttest(is_z, oos_z)
         results["zero"] = SignalMethodResult(
             full=full_z[0], signal=full_z[1],
             insample=is_z, outsample=oos_z, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 差分零值法
         full_dz = self.run_diff_zero_test(factor, returns)
-        is_dz, oos_dz = _try_is_oos(
-            lambda: self.run_diff_zero_test(is_factor, is_returns),
-            lambda: self.run_diff_zero_test(oos_factor, oos_returns),
-        )
+        is_dz, oos_dz = _split_eval(full_dz[1])
+        _t, _p = _is_oos_long_ttest(is_dz, oos_dz)
         results["diff_zero"] = SignalMethodResult(
             full=full_dz[0], signal=full_dz[1],
             insample=is_dz, outsample=oos_dz, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 250日移动平均差分零值法
         full_ma250 = self.run_diff_zero_test(factor.rolling(250).mean(), returns)
-        is_ma250, oos_ma250 = _try_is_oos(
-            lambda: self.run_diff_zero_test(is_factor.rolling(250).mean(), is_returns),
-            lambda: self.run_diff_zero_test(oos_factor.rolling(250).mean(), oos_returns),
-        )
+        is_ma250, oos_ma250 = _split_eval(full_ma250[1])
+        _t, _p = _is_oos_long_ttest(is_ma250, oos_ma250)
         results["MA250_diff_zero"] = SignalMethodResult(
             full=full_ma250[0], signal=full_ma250[1],
             insample=is_ma250, outsample=oos_ma250, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         # 长短均线差值法
         full_mad = self.run_ma_diff_zero_test(factor, returns, ma_short, ma_long)
-        is_mad, oos_mad = _try_is_oos(
-            lambda: self.run_ma_diff_zero_test(is_factor, is_returns, ma_short, ma_long),
-            lambda: self.run_ma_diff_zero_test(oos_factor, oos_returns, ma_short, ma_long),
-        )
+        is_mad, oos_mad = _split_eval(full_mad[1])
+        _t, _p = _is_oos_long_ttest(is_mad, oos_mad)
         results["ma_diff_zero"] = SignalMethodResult(
             full=full_mad[0], signal=full_mad[1],
             insample=is_mad, outsample=oos_mad, split_date=split_date,
+            is_oos_long_t_stat=_t, is_oos_long_t_pval=_p,
         )
 
         return results

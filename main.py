@@ -814,6 +814,295 @@ class ExcelReporter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 信号检测法方法结果 XLSX
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_method_result_xlsx(
+    sig_name: str,
+    ev: "TimingFactorEvaluator",
+    save_path: "Path",
+) -> None:
+    """
+    将信号检测法各方法的完整指标保存为 method_result.xlsx。
+
+    每种方法对应一张 Sheet，格式参照 summary() 输出，附 IS/OOS 对比表。
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    except ImportError:
+        raise ImportError("需要安装 openpyxl：pip install openpyxl")
+
+    _LABEL = {
+        "threshold":       "阈值法",
+        "moving_average":  "均线法",
+        "percentile":      "极值法",
+        "zero":            "零值法",
+        "diff_zero":       "差分零值法",
+        "MA250_diff_zero": "250日MA差分零值法",
+        "ma_diff_zero":    "长短均线差值法",
+    }
+
+    # ── 颜色主题 ──────────────────────────────────────────────────────────────
+    CLR_TITLE   = "1F3864"   # 深蓝（大标题行）
+    CLR_SECTION = "2E75B6"   # 中蓝（分区标题）
+    CLR_HEADER  = "BDD7EE"   # 浅蓝（列标题）
+    CLR_KEY     = "DEEAF1"   # 极浅蓝（指标名列）
+    CLR_IS      = "E2EFDA"   # 浅绿（样本内列）
+    CLR_OOS     = "FCE4D6"   # 浅橙（样本外列）
+    CLR_POS     = "375623"   # 深绿文字（正值）
+    CLR_NEG     = "9C0006"   # 深红文字（负值）
+
+    def _fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color)
+
+    def _font(bold=False, color="000000", size=10):
+        return Font(bold=bold, color=color, size=size, name="微软雅黑")
+
+    _thin   = Side(style="thin", color="AAAAAA")
+    _border = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+    _center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    _left   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+
+    def _pct(v):  return f"{v:.2%}"
+    def _f4(v):   return f"{v:.4f}"
+    def _f6(v):   return f"{v:.6f}"
+    def _pl(v):   return "∞" if np.isinf(v) else f"{v:.4f}"
+    def _int_(v): return str(int(v))
+
+    def _star(p):
+        if p < 0.01: return "***"
+        if p < 0.05: return "**"
+        if p < 0.10: return "*"
+        return ""
+
+    def _is_pos(s):
+        try:
+            v = float(str(s).replace("%", "").replace("∞", "inf").replace("↑","").replace("↓",""))
+            if v > 0: return True
+            if v < 0: return False
+        except Exception:
+            pass
+        return None
+
+    wb = Workbook()
+    wb.remove(wb.active)  # 删除默认空白 Sheet
+
+    for method_key, smr in (ev._signal_results or {}).items():
+        sheet_name = _LABEL.get(method_key, method_key)
+        ws = wb.create_sheet(title=sheet_name)
+
+        full      = smr.full
+        isr       = smr.insample
+        oosr      = smr.outsample
+        has_split = smr.split_date is not None
+
+        # ── 列宽 ──────────────────────────────────────────────────────────────
+        ws.column_dimensions["A"].width = 22
+        ws.column_dimensions["B"].width = 18
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 18
+
+        cur_row = [1]   # 用列表让嵌套函数可修改
+
+        def _next():
+            r = cur_row[0]; cur_row[0] += 1; return r
+
+        def _write(r, col, value, fill=None, font=None, align=None, border=True):
+            c = ws.cell(row=r, column=col, value=value)
+            if fill:   c.fill      = fill
+            if font:   c.font      = font
+            if align:  c.alignment = align
+            if border: c.border    = _border
+            return c
+
+        # ── 大标题 ────────────────────────────────────────────────────────────
+        r = _next()
+        ws.merge_cells(f"A{r}:D{r}")
+        _write(r, 1,
+               f"信号检测法结果  ·  {sheet_name}  ·  {sig_name}",
+               fill=_fill(CLR_TITLE),
+               font=_font(bold=True, color="FFFFFF", size=13),
+               align=_center)
+        ws.row_dimensions[r].height = 30
+
+        # ── 基本信息行 ────────────────────────────────────────────────────────
+        r = _next()
+        ws.merge_cells(f"A{r}:B{r}")
+        _write(r, 1, f"信号名称：{sig_name}",
+               font=_font(size=10), align=_left, border=False)
+        ws.merge_cells(f"C{r}:D{r}")
+        split_str = str(smr.split_date)[:10] if has_split else "无样本内外分割"
+        _write(r, 3, f"样本分割日期：{split_str}",
+               font=_font(size=10), align=_left, border=False)
+        ws.row_dimensions[r].height = 18
+
+        cur_row[0] += 1  # 空行
+
+        # ── 列标题 ────────────────────────────────────────────────────────────
+        r = _next()
+        ws.row_dimensions[r].height = 18
+        for ci, (h, bg) in enumerate(
+            [("指标", CLR_HEADER), ("全样本", CLR_HEADER),
+             ("样本内 (IS)", CLR_IS), ("样本外 (OOS)", CLR_OOS)], start=1
+        ):
+            _write(r, ci, h, fill=_fill(bg), font=_font(bold=True, size=10), align=_center)
+
+        # ── 辅助：分区标题 ────────────────────────────────────────────────────
+        def _section(title):
+            r = _next()
+            ws.merge_cells(f"A{r}:D{r}")
+            _write(r, 1, title,
+                   fill=_fill(CLR_SECTION),
+                   font=_font(bold=True, color="FFFFFF", size=10),
+                   align=_left)
+            ws.row_dimensions[r].height = 17
+
+        # ── 辅助：普通指标行（从 SignalTestResult 对象取值） ─────────────────
+        def _mrow(label, attr, fmt):
+            r = _next()
+            _write(r, 1, label, fill=_fill(CLR_KEY), font=_font(size=10), align=_left)
+            for ci, obj in enumerate([full, isr, oosr], start=2):
+                if obj is None:
+                    v = "—"
+                else:
+                    raw = getattr(obj, attr, None)
+                    v = fmt(raw) if raw is not None else "—"
+                pos = _is_pos(v)
+                c = _write(r, ci, v, font=_font(size=10), align=_center)
+                if pos is True:  c.font = _font(color=CLR_POS, size=10)
+                if pos is False: c.font = _font(color=CLR_NEG, size=10)
+            ws.row_dimensions[r].height = 16
+
+        # ── 辅助：T 检验行（T统计量 + p值 + 星号） ───────────────────────────
+        def _trow(label, stat_attr, pval_attr):
+            r = _next()
+            _write(r, 1, label, fill=_fill(CLR_KEY), font=_font(size=10), align=_left)
+            for ci, obj in enumerate([full, isr, oosr], start=2):
+                if obj is None:
+                    v = "—"
+                else:
+                    t = getattr(obj, stat_attr, 0.0)
+                    p = getattr(obj, pval_attr, 1.0)
+                    v = f"{t:.4f}  (p={p:.4f}){_star(p)}"
+                _write(r, ci, v, font=_font(size=10), align=_center)
+            ws.row_dimensions[r].height = 16
+
+        # ── 策略概况 ──────────────────────────────────────────────────────────
+        _section("▌ 策略概况")
+        _mrow("策略总天数",   "n_total_days",    _int_)
+        _mrow("多头持仓天数", "n_long",          _int_)
+        _mrow("空头持仓天数", "n_short",         _int_)
+        _mrow("多头覆盖率",   "long_coverage",   _pct)
+        _mrow("空头覆盖率",   "short_coverage",  _pct)
+
+        # ── 方向指标 ──────────────────────────────────────────────────────────
+        _section("▌ 方向指标")
+        _mrow("综合胜率", "overall_win_rate", _pct)
+        _mrow("多头胜率", "long_win_rate",    _pct)
+        _mrow("空头胜率", "short_win_rate",   _pct)
+
+        # ── 收益与风险 ────────────────────────────────────────────────────────
+        _section("▌ 收益与风险")
+        _mrow("多头均收益率",  "long_avg_return",           _f6)
+        _mrow("空头均收益率",  "short_avg_return",          _f6)
+        _mrow("多空收益差",    "long_short_return_spread",  _f6)
+        _mrow("策略盈亏比",    "overall_pl_ratio",          _pl)
+        _mrow("年化夏普比率",  "sharpe_ratio",              _f4)
+        _mrow("最大回撤",      "max_drawdown",              _pct)
+
+        # ── T 检验 ────────────────────────────────────────────────────────────
+        _section("▌ T 检验")
+        _trow("多头收益 T 检验 (H₀:μ=0)", "long_t_stat",  "long_t_pval")
+        _trow("空头收益 T 检验 (H₀:μ=0)", "short_t_stat", "short_t_pval")
+        _trow("多空双样本 Welch T 检验",   "t_statistic",  "p_value")
+
+        # ── IS vs OOS 对比表 ──────────────────────────────────────────────────
+        if has_split and isr is not None and oosr is not None:
+            cur_row[0] += 1  # 空行
+
+            r = _next()
+            ws.merge_cells(f"A{r}:D{r}")
+            _write(r, 1, "▌ 样本内 vs 样本外 对比",
+                   fill=_fill(CLR_SECTION),
+                   font=_font(bold=True, color="FFFFFF", size=10),
+                   align=_left)
+            ws.row_dimensions[r].height = 17
+
+            # 对比表 4 列标题（指标 | IS | OOS | 变化）
+            r = _next()
+            ws.row_dimensions[r].height = 18
+            for ci, (h, bg) in enumerate(
+                [("指标", CLR_HEADER), ("样本内 (IS)", CLR_IS),
+                 ("样本外 (OOS)", CLR_OOS), ("变化 (OOS−IS)", CLR_HEADER)], start=1
+            ):
+                _write(r, ci, h, fill=_fill(bg), font=_font(bold=True, size=10), align=_center)
+
+            def _cmp(label, attr, fmt):
+                r = _next()
+                _write(r, 1, label, fill=_fill(CLR_KEY), font=_font(size=10), align=_left)
+                v_is  = getattr(isr,  attr, None)
+                v_oos = getattr(oosr, attr, None)
+                s_is  = fmt(v_is)  if v_is  is not None else "—"
+                s_oos = fmt(v_oos) if v_oos is not None else "—"
+                c2 = _write(r, 2, s_is,  font=_font(size=10), align=_center)
+                c2.fill = _fill(CLR_IS)
+                c3 = _write(r, 3, s_oos, font=_font(size=10), align=_center)
+                c3.fill = _fill(CLR_OOS)
+                try:
+                    delta = v_oos - v_is
+                    s_d = ("+" + fmt(delta)) if delta >= 0 else fmt(delta)
+                    c4 = _write(r, 4, s_d, font=_font(size=10), align=_center)
+                    c4.font = _font(color=(CLR_POS if delta > 0 else CLR_NEG), size=10)
+                except Exception:
+                    _write(r, 4, "—", font=_font(size=10), align=_center)
+                ws.row_dimensions[r].height = 16
+
+            _cmp("综合胜率",    "overall_win_rate",         _pct)
+            _cmp("多头胜率",    "long_win_rate",            _pct)
+            _cmp("多头均收益率","long_avg_return",          _f6)
+            _cmp("空头均收益率","short_avg_return",         _f6)
+            _cmp("年化夏普",    "sharpe_ratio",             _f4)
+            _cmp("最大回撤",    "max_drawdown",             _pct)
+
+            # ── IS vs OOS 多头收益跨期 T 检验 ─────────────────────────────────
+            cur_row[0] += 1  # 空行
+
+            r = _next()
+            ws.merge_cells(f"A{r}:D{r}")
+            _write(r, 1, "▌ IS vs OOS 多头收益跨期 T 检验",
+                   fill=_fill(CLR_SECTION),
+                   font=_font(bold=True, color="FFFFFF", size=10),
+                   align=_left)
+            ws.row_dimensions[r].height = 17
+
+            t_s = smr.is_oos_long_t_stat
+            t_p = smr.is_oos_long_t_pval
+            chg = oosr.long_avg_return - isr.long_avg_return
+            direction = "↑ 样本外更优" if chg > 0 else "↓ 样本外下降"
+
+            for lbl, val, pos in [
+                ("T 统计量",          f"{t_s:.4f}",             None),
+                ("p 值",              f"{t_p:.4f}{_star(t_p)}", None),
+                ("多头收益变化方向",  direction,                 chg > 0),
+                ("收益差 (OOS − IS)", f"{chg:+.6f}",            chg > 0),
+            ]:
+                r = _next()
+                _write(r, 1, lbl, fill=_fill(CLR_KEY), font=_font(size=10), align=_left)
+                ws.merge_cells(f"B{r}:D{r}")
+                clr = (CLR_POS if pos else CLR_NEG) if pos is not None else "000000"
+                _write(r, 2, val, font=_font(color=clr, size=10), align=_left)
+                ws.row_dimensions[r].height = 16
+
+        ws.freeze_panes = "A4"
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(save_path)
+    print(f"  ✓ 方法结果：{save_path.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 多因子横向对比图（复用 example 中的逻辑）
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1097,6 +1386,13 @@ def main() -> None:
             save_path  = excel_path,
         )
 
+        # ── 信号检测法方法结果 XLSX ─────────────────────────────────────
+        save_method_result_xlsx(
+            sig_name  = sig_name,
+            ev        = ev,
+            save_path = sig_dir / "method_result.xlsx",
+        )
+
         all_results.append((sig_name, ev, bt_res))
 
     # ── 多因子对比图（存放在 workspace 根目录）────────────────────────────────
@@ -1115,7 +1411,8 @@ def main() -> None:
         print(f"  ├── {safe}/")
         print(f"  │   ├── {eval_subdir}/   （评估图）")
         print(f"  │   ├── {bt_subdir}/  （回测图）")
-        print(f"  │   ├── position_table.csv  （仓位表）")
+        print(f"  │   ├── position_table.csv   （仓位表）")
+        print(f"  │   ├── method_result.xlsx  （信号检测法方法结果）")
         print(f"  │   └── {excel_filename}")
     print(f"  └── factor_comparison.png   （多信号对比图）")
     print()
